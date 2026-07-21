@@ -1,0 +1,41 @@
+[package]
+name = "opsctl-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "opsctl-server"
+path = "src/main.rs"
+
+[dependencies]
+opsctl-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = "0.8.9"
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+argon2 = "0.5.3"
+figment = { version = "0.10.19", features = ["toml", "env"] }
+uuid = { version = "1.23.4", features = ["v4"] }
+time = { version = "0.3.52", features = ["formatting", "local-offset", "macros"] }
+rand = "0.10.1"
+hex = "0.4.3"
+sha2 = "0.11.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+russh = { version = "0.61.2", default-features = false, features = ["ring", "flate2", "rsa"] }
+rust-embed = "8.11.0"
+mime_guess = "2.0.5"
+chacha20poly1305 = "0.10.1"
+base64 = "0.22.1"
+hmac = "0.12.1"
+sha1 = "0.10.6"
+data-encoding = "2.6.0"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

@@ -1,0 +1,14 @@
+target/
+**/*.rs.bk
+*.db
+*.db-*
+.env
+/data
+.gstack/
+deploy/certs/
+node_modules/
+dist-win/
+test-results/
+web/dist/
+playwright-report/
+server/data/

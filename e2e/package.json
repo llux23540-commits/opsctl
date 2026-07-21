@@ -1,0 +1,14 @@
+{
+  "name": "opsctl-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Independent Playwright e2e suite for opsctl (uses system Chrome; does not touch web/ config).",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1"
+  }
+}

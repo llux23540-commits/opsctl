@@ -1,0 +1,27 @@
+[package]
+name = "opsctl-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "opsctl-client"
+path = "src/main.rs"
+
+[dependencies]
+opsctl-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# Enable glow (OpenGL) renderer — avoids wgpu window-move ghosting on Windows.
+eframe = { version = "0.35.0", features = ["glow"] }
+machine-uid = "0.6.0"
+# Windows: default TLS = schannel (no NASM/openssl build tooling needed).
+reqwest = { version = "0.13.4", features = ["blocking", "json"] }
+sha2 = "0.11.0"
+hex = "0.4.3"
+directories = "6.0.0"
+uuid = { version = "1.23.4", features = ["v4"] }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

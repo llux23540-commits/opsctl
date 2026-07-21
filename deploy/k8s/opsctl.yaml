@@ -1,0 +1,120 @@
+# opsctl on Kubernetes. Apply after building & pushing the image:
+#   docker build -f deploy/Dockerfile -t <registry>/opsctl-server:<tag> .
+#   docker push <registry>/opsctl-server:<tag>
+#   # create the Secret (do NOT commit real values), then:
+#   kubectl apply -f deploy/k8s/opsctl.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opsctl
+---
+# Secrets. Create with real values instead of committing them, e.g.:
+#   kubectl -n opsctl create secret generic opsctl-secrets \
+#     --from-literal=jwt-secret="$(openssl rand -hex 32)" \
+#     --from-literal=vault-passphrase="$(openssl rand -hex 24)" \
+#     --from-literal=admin-password="$(openssl rand -hex 12)"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: opsctl-secrets
+  namespace: opsctl
+type: Opaque
+stringData:
+  jwt-secret: "REPLACE_ME"
+  vault-passphrase: "REPLACE_ME"
+  admin-password: "REPLACE_ME"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: opsctl-data
+  namespace: opsctl
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opsctl
+  namespace: opsctl
+spec:
+  replicas: 1                 # sqlite = single writer; scale-out needs Postgres
+  strategy:
+    type: Recreate           # RWO volume can't be shared across rolling pods
+  selector:
+    matchLabels: { app: opsctl }
+  template:
+    metadata:
+      labels: { app: opsctl }
+    spec:
+      containers:
+        - name: opsctl
+          image: REPLACE_ME/opsctl-server:latest
+          ports:
+            - containerPort: 8443
+          env:
+            - name: OPSCTL_SERVER__BIND
+              value: "0.0.0.0:8443"
+            - name: OPSCTL_STORE__URL
+              value: "sqlite://data/opsctl.db?mode=rwc"
+            - name: OPSCTL_DEV__SEED
+              value: "false"
+            - name: OPSCTL_AUTH__JWT_SECRET
+              valueFrom: { secretKeyRef: { name: opsctl-secrets, key: jwt-secret } }
+            - name: OPSCTL_VAULT__PASSPHRASE
+              valueFrom: { secretKeyRef: { name: opsctl-secrets, key: vault-passphrase } }
+            - name: OPSCTL_BOOTSTRAP__ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: opsctl-secrets, key: admin-password } }
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          readinessProbe:
+            httpGet: { path: /health, port: 8443 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8443 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "1", memory: "512Mi" }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: opsctl-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opsctl
+  namespace: opsctl
+spec:
+  selector: { app: opsctl }
+  ports:
+    - port: 80
+      targetPort: 8443
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: opsctl
+  namespace: opsctl
+  annotations:
+    # cert-manager / TLS as needed for your cluster
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+spec:
+  rules:
+    - host: opsctl.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: opsctl
+                port: { number: 80 }
