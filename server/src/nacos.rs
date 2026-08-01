@@ -1472,6 +1472,10 @@ pub struct ConfigsQuery {
     pub page_no: i64,
     #[serde(default = "def_page_size")]
     pub page_size: i64,
+    /// 命名空间是 Nacos 的硬隔离边界:配置永远从属于某个命名空间。
+    /// 留空 = 用集群登记时的默认命名空间。
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 fn def_page() -> i64 {
     1
@@ -1489,10 +1493,15 @@ pub async fn cluster_configs(
 ) -> Result<Json<Value>, AppError> {
     admin(&user)?;
     let c = load_cluster(&st, &id).await?;
-    let conn = conn_for(&st, &c)?;
+    let conn = with_namespace(conn_for(&st, &c)?, &q.namespace);
+    let ns = conn.namespace.clone();
     match list_configs(&conn, q.page_no, q.page_size.clamp(1, 500)).await {
-        Ok((total, items)) => Ok(Json(json!({ "ok": true, "total": total, "items": items }))),
-        Err(e) => Ok(Json(json!({ "ok": false, "total": 0, "items": [], "message": e }))),
+        Ok((total, items)) => {
+            Ok(Json(json!({ "ok": true, "namespace": ns, "total": total, "items": items })))
+        }
+        Err(e) => Ok(Json(
+            json!({ "ok": false, "namespace": ns, "total": 0, "items": [], "message": e }),
+        )),
     }
 }
 
@@ -1506,9 +1515,14 @@ pub struct ConfigRef {
     pub namespace: Option<String>,
 }
 
-/// 覆盖命名空间(同步 / 单条读写都可能指定别的 tenant)。
+/// 覆盖命名空间。
+///
+/// 语义必须是「字段缺失 = 用集群默认;显式给值(**含空串**)= 就用这个」——
+/// 因为 public 在 Nacos 里的 id 本身就是空串。如果把空串也当成「没填」,
+/// 那么当集群登记的默认空间不是 public 时,调用方就永远无法指向 public,
+/// 只会静默落到集群默认空间上(删错、同步错空间)。
 fn with_namespace(mut conn: NacosConn, ns: &Option<String>) -> NacosConn {
-    if let Some(n) = ns.as_ref().filter(|n| !n.trim().is_empty()) {
+    if let Some(n) = ns {
         conn.namespace = n.trim().to_string();
     }
     conn
@@ -1629,6 +1643,7 @@ pub async fn sync_cluster(
             created_at: now_secs(),
             // 同步下来的是真实配置,里面的 ${} 属于应用,回放时必须原样发出去
             literal: 1,
+            namespace: ns.clone(),
         })
         .await
         .map_err(AppError::Internal)?;
@@ -1665,8 +1680,8 @@ pub async fn init_cluster(
     // items: explicit ones win, otherwise the template's.
     // `literal` 模板(同步回来的真实配置)按原文下发 —— 里面的 `${...}` 是应用自己的
     // 占位符,不是 opsctl 的模板变量,拿去代入只会让整批回放失败。
-    let (items, template_id, template_name, mut literal) = if !req.items.is_empty() {
-        (req.items.clone(), String::new(), String::new(), false)
+    let (items, template_id, template_name, mut literal, tpl_ns) = if !req.items.is_empty() {
+        (req.items.clone(), String::new(), String::new(), false, String::new())
     } else if let Some(tid) = req.template_id.clone().filter(|t| !t.is_empty()) {
         let t = st
             .store
@@ -1676,9 +1691,9 @@ pub async fn init_cluster(
             .ok_or_else(|| AppError::BadRequest("配置模板不存在".into()))?;
         let parsed: Vec<NacosConfigItem> = serde_json::from_str(&t.items)
             .map_err(|e| AppError::BadRequest(format!("模板配置项无法解析:{e}")))?;
-        (parsed, t.id, t.name, t.literal != 0)
+        (parsed, t.id, t.name, t.literal != 0, t.namespace)
     } else {
-        (Vec::new(), String::new(), String::new(), false)
+        (Vec::new(), String::new(), String::new(), false, String::new())
     };
     if items.is_empty() {
         return Err(AppError::BadRequest("没有要初始化的配置项".into()));
@@ -1688,9 +1703,13 @@ pub async fn init_cluster(
         literal = !sub;
     }
 
+    // 目标命名空间优先级:请求显式指定(含空串 = public)> 模板归属 > 集群默认。
+    // 配置在 Nacos 里是按命名空间硬隔离的,发错空间等于发到别的环境。
     let mut conn = conn_for(&st, &c)?;
-    if let Some(ns) = req.namespace.clone().filter(|n| !n.trim().is_empty()) {
+    if let Some(ns) = req.namespace.as_ref() {
         conn.namespace = ns.trim().to_string();
+    } else if !tpl_ns.is_empty() {
+        conn.namespace = tpl_ns;
     }
 
     let empty_vars = BTreeMap::new();
@@ -1785,6 +1804,9 @@ pub struct SaveNacosTemplate {
     /// true = 按原文下发,不做 `${}` 变量代入
     #[serde(default)]
     pub literal: bool,
+    /// 模板归属/默认目标命名空间
+    #[serde(default)]
+    pub namespace: String,
 }
 
 pub async fn save_template(
@@ -1819,6 +1841,7 @@ pub async fn save_template(
             items: serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
             created_at,
             literal: i64::from(req.literal),
+            namespace: req.namespace.trim().to_string(),
         })
         .await
         .map_err(AppError::Internal)?;
@@ -2178,6 +2201,166 @@ pub async fn revoke_permission_api(
     let out = revoke_permission(&ctx, &q.role, &q.resource, &q.action).await;
     let payload = json!({ "role": q.role, "resource": q.resource, "action": q.action });
     done(&st, &user, &c, "nacos_perm_revoke", payload, out).await
+}
+
+// ---- 以「用户」为中心的授权视图 ----
+//
+// Nacos 的模型是 用户 →(绑定)→ 角色 →(赋权)→ 资源。三张表分开看,谁能动哪个命名空间
+// 根本看不出来。这里把它折叠成一个问题:**这个账号能操作哪些命名空间**,
+// 并提供一步到位的授权(需要角色就自动建一个),把中间那层角色藏在后面但仍如实展示。
+
+/// 资源串 `<namespaceId>:<group>:<type>/<name>` 的第一段就是命名空间(public 为空)。
+fn resource_namespace(resource: &str) -> String {
+    resource.split(':').next().unwrap_or_default().to_string()
+}
+
+/// 该用户绑定的角色(排除 ROLE_ADMIN —— 那是全局管理员,不由这里管理)。
+async fn roles_of(ctx: &AdminCtx, username: &str) -> Result<(Vec<String>, bool), String> {
+    let (_, rows) = list_roles(ctx, 1, 500).await?;
+    let mut roles = Vec::new();
+    let mut is_admin = false;
+    for r in rows {
+        if str_at(&r, "username") != username {
+            continue;
+        }
+        let role = str_at(&r, "role");
+        if role == "ROLE_ADMIN" {
+            is_admin = true;
+        } else if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    Ok((roles, is_admin))
+}
+
+/// `GET /nacos/clusters/{id}/users/{username}/access`
+/// —— 一个账号的角色 + 这些角色带来的权限(按命名空间归并)。
+pub async fn user_access(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Path((id, username)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    let (_, ctx) = ctx_for(&st, &id).await?;
+    let (roles, is_admin) = roles_of(&ctx, &username).await.map_err(AppError::BadRequest)?;
+    let (_, all) = list_permissions(&ctx, 1, 500, "").await.map_err(AppError::BadRequest)?;
+    let grants: Vec<Value> = all
+        .iter()
+        .filter(|p| roles.contains(&str_at(p, "role")))
+        .map(|p| {
+            let resource = str_at(p, "resource");
+            json!({
+                "role": str_at(p, "role"),
+                "resource": resource.clone(),
+                "namespace_id": resource_namespace(&resource),
+                "action": str_at(p, "action"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "ok": true, "username": username, "roles": roles,
+        "global_admin": is_admin, "grants": grants
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct GrantReq {
+    pub username: String,
+    /// 命名空间 id;空串 = public
+    #[serde(default)]
+    pub namespace_id: String,
+    /// r | w | rw
+    pub action: String,
+}
+
+/// 这个用户在这个集群上的「工作角色」:已有非 ROLE_ADMIN 角色就复用第一个,
+/// 否则用 `<username>-role`(Nacos 里角色就是个字符串,没有独立实体)。
+fn work_role(username: &str, roles: &[String]) -> String {
+    roles.first().cloned().unwrap_or_else(|| format!("{username}-role"))
+}
+
+/// `POST /nacos/clusters/{id}/grant` — 一步授权:选账号 + 命名空间 + 读写,
+/// 缺角色就自动创建并绑定,再赋权到 `<ns>:*:*`(Nacos 控制台也只写这一种资源串)。
+pub async fn grant_user(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<GrantReq>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    let (c, ctx) = ctx_for(&st, &id).await?;
+    validate_action(&req.action).map_err(AppError::BadRequest)?;
+    if req.username.trim().is_empty() {
+        return Err(AppError::BadRequest("请选择账号".into()));
+    }
+
+    let (roles, is_admin) = roles_of(&ctx, &req.username).await.map_err(AppError::BadRequest)?;
+    if is_admin && roles.is_empty() {
+        return Err(AppError::BadRequest(
+            "该账号是全局管理员(ROLE_ADMIN),已拥有全部权限,无需单独授权".into(),
+        ));
+    }
+    let role = work_role(&req.username, &roles);
+    let created_role = roles.is_empty();
+    let resource = format!("{}:*:*", req.namespace_id);
+
+    let payload = json!({
+        "username": req.username, "namespace_id": req.namespace_id,
+        "action": req.action, "role": role, "created_role": created_role
+    });
+    // 顺序不能反:Nacos 赋权时要求角色已存在,否则 400 "role X not found!"
+    let outcome = async {
+        if created_role {
+            bind_role(&ctx, &role, &req.username).await?;
+        }
+        grant_permission(&ctx, &role, &resource, &req.action).await
+    }
+    .await;
+
+    match outcome {
+        Ok(()) => {
+            audit_admin(&st, &user, &c, "nacos_grant", payload, "ok").await;
+            Ok(Json(json!({
+                "ok": true, "role": role, "created_role": created_role, "resource": resource
+            })))
+        }
+        Err(e) => {
+            let mut p = payload;
+            if let Some(o) = p.as_object_mut() {
+                o.insert("error".into(), json!(e));
+            }
+            audit_admin(&st, &user, &c, "nacos_grant", p, "fail").await;
+            Err(AppError::BadRequest(e))
+        }
+    }
+}
+
+/// `DELETE /nacos/clusters/{id}/grant?username=&namespace_id=&action=` — 收回这条授权。
+pub async fn revoke_user(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<GrantReq>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    let (c, ctx) = ctx_for(&st, &id).await?;
+    let (roles, _) = roles_of(&ctx, &q.username).await.map_err(AppError::BadRequest)?;
+    if roles.is_empty() {
+        return Err(AppError::BadRequest("该账号没有可收回的角色".into()));
+    }
+    let resource = format!("{}:*:*", q.namespace_id);
+    let mut last_err = None;
+    let mut done_any = false;
+    for role in &roles {
+        match revoke_permission(&ctx, role, &resource, &q.action).await {
+            Ok(()) => done_any = true,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let payload =
+        json!({ "username": q.username, "namespace_id": q.namespace_id, "action": q.action });
+    let out = if done_any { Ok(()) } else { Err(last_err.unwrap_or_else(|| "收回失败".into())) };
+    done(&st, &user, &c, "nacos_revoke", payload, out).await
 }
 
 #[cfg(test)]

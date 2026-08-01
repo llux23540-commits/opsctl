@@ -130,6 +130,14 @@ pub fn build_router(state: AppState) -> Router {
             get(nacos::list_users_api).post(nacos::create_user_api).put(nacos::reset_user_api),
         )
         .route(
+            "/nacos/clusters/{id}/users/{username}/access",
+            get(nacos::user_access),
+        )
+        .route(
+            "/nacos/clusters/{id}/grant",
+            post(nacos::grant_user).delete(nacos::revoke_user),
+        )
+        .route(
             "/nacos/clusters/{id}/users/{username}",
             axum::routing::delete(nacos::delete_user_api),
         )

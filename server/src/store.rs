@@ -275,6 +275,9 @@ pub struct NacosTemplateRow {
     /// json: `[{data_id,group,type,content}]`
     pub items: String,
     pub created_at: i64,
+    /// 模板归属的命名空间(同步时记录来源;回放时作为默认目标)。
+    /// Nacos 是按命名空间硬隔离的,一份配置集合脱离命名空间就没有意义。
+    pub namespace: String,
     /// 1 = 按原文下发,不做 `${}` 变量代入。
     /// 从远端同步回来的配置里那些 `${...}` 是应用自己的占位符(Spring 等),
     /// 当成 opsctl 模板变量去要求填值只会让回放失败。
@@ -488,7 +491,8 @@ impl Store {
             note TEXT NOT NULL DEFAULT '',
             items TEXT NOT NULL DEFAULT '[]',              -- json: [{data_id,group,type,content}]
             created_at INTEGER NOT NULL DEFAULT 0,
-            literal INTEGER NOT NULL DEFAULT 0            -- 1 = 原文下发,不做变量代入
+            literal INTEGER NOT NULL DEFAULT 0,           -- 1 = 原文下发,不做变量代入
+            namespace TEXT NOT NULL DEFAULT ''            -- 归属/默认目标命名空间
         );
         CREATE TABLE IF NOT EXISTS nacos_init_runs (
             id TEXT PRIMARY KEY,
@@ -566,6 +570,11 @@ impl Store {
             .await;
         let _ = sqlx::query(
             "ALTER TABLE nacos_config_templates ADD COLUMN literal INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE nacos_config_templates ADD COLUMN namespace TEXT NOT NULL DEFAULT ''",
         )
         .execute(&self.pool)
         .await;
@@ -1308,10 +1317,10 @@ impl Store {
 
     pub async fn save_nacos_template(&self, t: &NacosTemplateRow) -> Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO nacos_config_templates (id,name,note,items,created_at,literal) \
-             VALUES (?,?,?,?,?,?)")
+            "INSERT OR REPLACE INTO nacos_config_templates \
+             (id,name,note,items,created_at,literal,namespace) VALUES (?,?,?,?,?,?,?)")
             .bind(&t.id).bind(&t.name).bind(&t.note).bind(&t.items).bind(t.created_at)
-            .bind(t.literal)
+            .bind(t.literal).bind(&t.namespace)
             .execute(&self.pool).await?;
         Ok(())
     }

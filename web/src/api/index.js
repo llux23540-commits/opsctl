@@ -113,6 +113,8 @@ export const api = {
   updateNacosCluster: (id, body) => http.put(`/nacos/clusters/${id}`, body).then((r) => r.data),
   deleteNacosCluster: (id) => http.delete(`/nacos/clusters/${id}`).then((r) => r.data),
   nacosNodes: (id) => http.get(`/nacos/clusters/${id}/nodes`).then((r) => r.data),
+  /// 配置从属于命名空间(Nacos 的硬隔离边界),所以 params 必须带 namespace;
+  /// 留空后端才回落到集群登记的那个默认空间。
   nacosConfigs: (id, params) => http.get(`/nacos/clusters/${id}/configs`, { params }).then((r) => r.data),
   nacosInit: (id, body) => http.post(`/nacos/clusters/${id}/init`, body).then((r) => r.data),
   nacosProbe: (body) => http.post('/nacos/probe', body).then((r) => r.data),
@@ -135,6 +137,10 @@ export const api = {
   nacosPermissions: (id, params) => http.get(`/nacos/clusters/${id}/permissions`, { params }).then((r) => r.data),
   grantNacosPermission: (id, body) => http.post(`/nacos/clusters/${id}/permissions`, body).then((r) => r.data),
   revokeNacosPermission: (id, params) => http.delete(`/nacos/clusters/${id}/permissions`, { params }).then((r) => r.data),
+  // ---- Nacos 权限:以「账号」为中心的视图 + 一步授权/收回(角色由后端自动补齐)----
+  nacosUserAccess: (id, name) => http.get(`/nacos/clusters/${id}/users/${encodeURIComponent(name)}/access`).then((r) => r.data),
+  grantNacosUser: (id, body) => http.post(`/nacos/clusters/${id}/grant`, body).then((r) => r.data),
+  revokeNacosUser: (id, params) => http.delete(`/nacos/clusters/${id}/grant`, { params }).then((r) => r.data),
   // ---- Nacos 配置:读正文 / 删除 / 整库同步为模板 ----
   nacosConfigDetail: (id, params) => http.get(`/nacos/clusters/${id}/configs/detail`, { params }).then((r) => r.data),
   deleteNacosConfig: (id, params) => http.delete(`/nacos/clusters/${id}/configs`, { params }).then((r) => r.data),

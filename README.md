@@ -13,7 +13,8 @@ Rust workspace:`core`(共享模型/DTO)、`server`(opsctl-vault,axum + SQLite,�
 - **Nacos 管理**(admin):登记多套 Nacos 集群 → 总览页实时拉取成员节点(`/v2|v1/core/cluster/nodes`,不可用时降级为地址探活);
   「初始化配置」按模板 + `${变量}` 逐条下发(`/v1/cs/configs`),默认不覆盖已存在的 dataId,支持试运行;
   **「同步」把远端整个命名空间的配置拉回来存成模板**(标记为原文下发,配置里的 `${...}` 属于应用,不做代入),
-  于是 dev→test 克隆 = 同步一次 + 回放一次;集群详情页还直连管理面 API 做**命名空间 / 账号 / 角色绑定 / 赋权 / 配置增删查**
+  于是 dev→test 克隆 = 同步一次 + 回放一次;集群详情页按 Nacos 的真实模型组织:**命名空间 → 配置**(左选空间右列配置,同步/删除都作用于选中空间)、
+  **账号与权限**(选账号即见它能操作哪些命名空间,一步授权自动补角色)
   (1.x·2.x 走 `/v1/auth/*` + `/v1/console/namespaces`,3.x 自动切 `/v3/auth/*` + `/v3/console/core/namespace`);
   集群口令进金库加密,每次写操作落审计。
 - **其它屏**:执行模板(变量代入)、消息中心(站内通知)、审计(筛选+详情+CSV/JSON 导出)、设置(个人/会话撤销/金库/Telegram·Git 配置)。
@@ -35,7 +36,7 @@ cd web && npm run dev                                        # 前端
 
 ## 测试
 ```bash
-cargo test -p opsctl-server      # 80 个 API 集成测试(临时 sqlite,隔离并行;Nacos 用内置 mock 驱动)
+cargo test -p opsctl-server      # 83 个 API 集成测试(临时 sqlite,隔离并行;Nacos 用内置 mock 驱动)
 ```
 
 ## 部署

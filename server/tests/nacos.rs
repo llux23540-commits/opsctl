@@ -820,3 +820,125 @@ async fn synced_template_replays_app_placeholders_verbatim() {
     assert!(v["items"][0]["message"].as_str().unwrap().contains("mysql8.jdbc.url"), "{v}");
     assert!(dst2.config("", "G", "db.yml").is_none());
 }
+
+#[tokio::test]
+async fn explicit_empty_namespace_targets_public_not_cluster_default() {
+    // public 的 id 在 Nacos 里就是空串。如果把「空串」也当成「没填 → 用集群默认」,
+    // 那么集群默认不是 public 时就永远指不到 public,删除/同步会静默落错空间。
+    // 语义:字段缺失 = 集群默认;显式给值(含空串)= 就用这个。
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let nacos = mock_nacos().await;
+    let (s, v) = app
+        .post(
+            "/nacos/clusters",
+            &admin,
+            "admin-dev",
+            json!({ "name": "默认非 public", "server_addr": nacos.addr, "context_path": "/nacos",
+                    "namespace": "tenantA", "username": "nacos", "password": "nacos-pass" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // 不给 namespace → 落集群默认 tenantA
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "items": [{ "data_id": "a.yaml", "group": "G", "content": "in: tenantA" }] }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["namespace"], "tenantA");
+    assert_eq!(nacos.config("tenantA", "G", "a.yaml").unwrap(), "in: tenantA");
+    assert!(nacos.config("", "G", "a.yaml").is_none(), "不该落到 public");
+
+    // 显式空串 → 落 public,而不是集群默认
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "namespace": "",
+                    "items": [{ "data_id": "a.yaml", "group": "G", "content": "in: public" }] }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["namespace"], "");
+    assert_eq!(nacos.config("", "G", "a.yaml").unwrap(), "in: public");
+    assert_eq!(nacos.config("tenantA", "G", "a.yaml").unwrap(), "in: tenantA", "tenantA 不应被改动");
+
+    // 列表同理:显式空串看 public,缺省看 tenantA
+    let (s, v) = app.get(&format!("/nacos/clusters/{id}/configs?namespace="), &admin, "admin-dev").await;
+    assert_eq!(s, 200);
+    assert_eq!(v["namespace"], "");
+    assert_eq!(v["total"], 1);
+    let (s, v) = app.get(&format!("/nacos/clusters/{id}/configs"), &admin, "admin-dev").await;
+    assert_eq!(s, 200);
+    assert_eq!(v["namespace"], "tenantA");
+
+    // 删除也必须认显式空串(否则会删掉 tenantA 里的同名配置)
+    let (s, _) = app
+        .delete(
+            &format!("/nacos/clusters/{id}/configs?data_id=a.yaml&group=G&namespace="),
+            &admin,
+            "admin-dev",
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert!(nacos.config("", "G", "a.yaml").is_none());
+    assert!(nacos.config("tenantA", "G", "a.yaml").is_some(), "只应删 public 那条");
+}
+
+#[tokio::test]
+async fn template_namespace_becomes_default_replay_target() {
+    // 模板归属命名空间:回放时默认发回同一个空间,不用每次手填。
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let nacos = mock_nacos().await;
+    let id = register_cluster(&app, &admin, &nacos.addr).await;
+
+    let (s, t) = app
+        .post(
+            "/nacos/templates",
+            &admin,
+            "admin-dev",
+            json!({ "name": "带归属的模板", "namespace": "tenantB", "literal": true,
+                    "items": [{ "data_id": "x.yaml", "group": "G", "content": "k: v" }] }),
+        )
+        .await;
+    assert_eq!(s, 200, "{t}");
+    let tpl = t["id"].as_str().unwrap().to_string();
+
+    let (_, list) = app.get("/nacos/templates", &admin, "admin-dev").await;
+    assert_eq!(list[0]["namespace"], "tenantB");
+    assert_eq!(list[0]["literal"], 1);
+
+    // 集群默认是 public,但模板归属 tenantB → 应发到 tenantB
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "template_id": tpl }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["namespace"], "tenantB");
+    assert_eq!(nacos.config("tenantB", "G", "x.yaml").unwrap(), "k: v");
+
+    // 显式指定则覆盖模板归属
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "template_id": tpl, "namespace": "tenantC" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["namespace"], "tenantC");
+    assert_eq!(nacos.config("tenantC", "G", "x.yaml").unwrap(), "k: v");
+}

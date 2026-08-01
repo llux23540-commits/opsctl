@@ -278,6 +278,8 @@ const init = reactive({
   items: [],
   vars: {},
   namespace: '',
+  /// 默认收起:目标空间已由模板/集群决定,只有要发到别处才展开
+  nsOverride: false,
   overwrite: false,
   running: false,
   result: null,
@@ -290,10 +292,27 @@ function openInit(c) {
   init.items = [];
   init.vars = {};
   init.namespace = '';
+  init.nsOverride = false;
   init.overwrite = false;
   init.result = null;
   init.show = true;
 }
+
+/// 目标命名空间的解析顺序,和后端保持一致:显式覆盖 > 模板归属 > 集群默认。
+/// UI 只是把这条规则显式说出来,免得人猜配置会落到哪儿。
+const selectedTpl = computed(() =>
+  init.mode === 'template' ? templates.value.find((t) => t.id === init.templateId) : null
+);
+const effectiveNs = computed(() => {
+  if (init.namespace.trim()) return init.namespace.trim();
+  if (selectedTpl.value?.namespace) return selectedTpl.value.namespace;
+  return init.cluster?.namespace || '';
+});
+const nsOrigin = computed(() => {
+  if (init.namespace.trim()) return '· 本次指定';
+  if (selectedTpl.value?.namespace) return '· 跟随模板归属';
+  return '· 集群默认';
+});
 
 const templateOpts = computed(() =>
   templates.value.map((t) => ({ label: `${t.name}(${itemsOf(t).length} 项)`, value: t.id }))
@@ -422,12 +441,16 @@ async function loadTemplates() {
   }
 }
 
-const tplForm = reactive({ show: false, saving: false, id: null, name: '', note: '', items: [] });
+const tplForm = reactive({
+  show: false, saving: false, id: null, name: '', note: '', namespace: '', literal: false, items: [],
+});
 
 function openTplNew() {
   tplForm.id = null;
   tplForm.name = '';
   tplForm.note = '';
+  tplForm.namespace = '';
+  tplForm.literal = false;
   tplForm.items = [{ data_id: '', group: 'DEFAULT_GROUP', type: 'properties', content: '' }];
   tplForm.show = true;
 }
@@ -435,6 +458,8 @@ function openTplEdit(t) {
   tplForm.id = t.id;
   tplForm.name = t.name;
   tplForm.note = t.note || '';
+  tplForm.namespace = t.namespace || '';
+  tplForm.literal = !!t.literal;
   tplForm.items = itemsOf(t);
   tplForm.show = true;
 }
@@ -449,6 +474,8 @@ async function saveTpl() {
       id: tplForm.id,
       name: tplForm.name,
       note: tplForm.note,
+      namespace: tplForm.namespace,
+      literal: tplForm.literal,
       items: tplForm.items,
     });
     message.success('模板已保存');
@@ -470,16 +497,37 @@ async function removeTpl(t) {
   }
 }
 
+/// 模板按「归属命名空间」分组展示 —— Nacos 是按命名空间硬隔离的,
+/// 一份配置集合脱离命名空间就说不清该发到哪。同步产生的模板自带来源命名空间。
+const tplGroups = computed(() => {
+  const by = new Map();
+  for (const t of templates.value) {
+    const key = t.namespace || '';
+    if (!by.has(key)) by.set(key, []);
+    by.get(key).push(t);
+  }
+  return [...by.entries()]
+    .sort((a, b) => (a[0] === '' ? -1 : b[0] === '' ? 1 : a[0].localeCompare(b[0])))
+    .map(([ns, list]) => ({ ns, label: ns || '未指定命名空间', list }));
+});
+
 const tplColumns = [
   { title: '模板名称', key: 'name' },
   {
     title: '配置项',
     key: 'items',
-    width: 100,
+    width: 90,
     render: (t) => h('span', { class: 'num' }, itemsOf(t).length),
   },
+  {
+    title: '下发方式',
+    key: 'literal',
+    width: 110,
+    render: (t) =>
+      h('span', { class: `pill ${t.literal ? 'pill-ok' : 'pill-muted'}` }, t.literal ? '原文' : '变量代入'),
+  },
   { title: '备注', key: 'note', render: (t) => t.note || '—' },
-  { title: '创建时间', key: 'created_at', width: 180, render: (t) => fmtTime(t.created_at) },
+  { title: '创建时间', key: 'created_at', width: 170, render: (t) => fmtTime(t.created_at) },
   {
     title: '操作',
     key: 'ops',
@@ -707,7 +755,7 @@ onMounted(async () => {
         <n-card size="small" :bordered="false">
           <template #header>
             <span class="card-title">初始化模板</span>
-            <span class="card-sub">一组 dataId 的基线内容,支持 ${变量} 占位</span>
+            <span class="card-sub">按归属命名空间分组;可一键回放到任意集群</span>
           </template>
           <template #header-extra>
             <n-button size="small" type="primary" @click="openTplNew">
@@ -717,18 +765,26 @@ onMounted(async () => {
           <div v-if="!templates.length && !loading.templates" class="empty-page sm">
             <Icon name="file" :size="26" />
             <h3>还没有配置模板</h3>
-            <p>把上线所需的 Nacos 配置沉淀成模板,新集群可一键初始化。</p>
+            <p>去集群管理页的「命名空间与配置」把远端配置同步下来,或在这里手写一份。</p>
             <n-button type="primary" size="small" @click="openTplNew">新建模板</n-button>
           </div>
-          <n-data-table
-            v-else
-            :columns="tplColumns"
-            :data="templates"
-            :loading="loading.templates"
-            :bordered="false"
-            :scroll-x="760"
-            size="small"
-          />
+          <div v-else class="tpl-groups">
+            <section v-for="g in tplGroups" :key="g.ns" class="tpl-group">
+              <h4>
+                <Icon name="database" :size="13" />
+                <span class="mono">{{ g.ns || 'public / 未指定' }}</span>
+                <span class="dim num">{{ g.list.length }} 个模板</span>
+              </h4>
+              <n-data-table
+                :columns="tplColumns"
+                :data="g.list"
+                :loading="loading.templates"
+                :bordered="false"
+                :scroll-x="760"
+                size="small"
+              />
+            </section>
+          </div>
         </n-card>
       </n-tab-pane>
 
@@ -950,8 +1006,19 @@ onMounted(async () => {
         <!-- 3. 目标与策略 -->
         <section class="step">
           <h4><span class="idx">{{ initVarNames.length ? 3 : 2 }}</span> 目标与策略</h4>
-          <div class="f-grid">
-            <n-form-item label="命名空间" label-placement="top" :show-feedback="false">
+          <!-- 简化:目标命名空间默认跟随模板归属(同步下来的模板自带来源空间),
+               只有真要发到别处时才展开改 -->
+          <div class="target-ns">
+            <Icon name="database" :size="13" />
+            <span>目标命名空间</span>
+            <b class="mono">{{ effectiveNs || 'public' }}</b>
+            <span class="dim">{{ nsOrigin }}</span>
+            <button class="link" type="button" @click="init.nsOverride = !init.nsOverride">
+              {{ init.nsOverride ? '收起' : '改到别的空间' }}
+            </button>
+          </div>
+          <div v-if="init.nsOverride" class="f-grid" style="margin-top:10px">
+            <n-form-item label="命名空间 ID" label-placement="top" :show-feedback="false">
               <n-input
                 v-model:value="init.namespace"
                 size="small"
@@ -959,6 +1026,8 @@ onMounted(async () => {
                 :placeholder="init.cluster?.namespace || 'public(集群默认)'"
               />
             </n-form-item>
+          </div>
+          <div class="f-grid" style="margin-top:10px">
             <n-form-item label="已存在的 dataId" label-placement="top" :show-feedback="false">
               <n-switch v-model:value="init.overwrite" size="small" />
               <span class="help" style="margin-left:10px">
@@ -1028,10 +1097,19 @@ onMounted(async () => {
           <n-form-item label="模板名称" required>
             <n-input v-model:value="tplForm.name" placeholder="如:微服务上线基线" />
           </n-form-item>
-          <n-form-item label="备注">
-            <n-input v-model:value="tplForm.note" placeholder="适用范围" />
+          <n-form-item label="归属命名空间">
+            <n-input v-model:value="tplForm.namespace" class="mono" placeholder="留空 = public" />
           </n-form-item>
         </div>
+        <n-form-item label="备注">
+          <n-input v-model:value="tplForm.note" placeholder="适用范围" />
+        </n-form-item>
+        <n-form-item label="下发方式">
+          <n-switch v-model:value="tplForm.literal" size="small" />
+          <span class="help" style="margin-left:10px">
+            {{ tplForm.literal ? '按原文下发,不做 ${} 变量代入(同步下来的真实配置用这个)' : '做 ${变量} 代入,下发前需填值' }}
+          </span>
+        </n-form-item>
         <n-form-item label="配置项">
           <NacosConfigItems v-model="tplForm.items" />
         </n-form-item>
@@ -1176,6 +1254,16 @@ onMounted(async () => {
 .p-ok { color: var(--success); background: color-mix(in oklab, var(--success), transparent 90%); }
 .p-bad { color: var(--danger); background: color-mix(in oklab, var(--danger), transparent 90%); }
 
+.tpl-groups { display: flex; flex-direction: column; gap: 18px; }
+.tpl-group h4 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px;
+  font-size: 12.5px; font-weight: 600; color: var(--fg-2); }
+.tpl-group h4 .dim { margin-left: auto; font-size: 11.5px; }
+.target-ns { display: flex; align-items: center; gap: 8px; padding: 9px 12px;
+  border-radius: 8px; background: var(--bg); font-size: 12.5px; color: var(--fg-2); }
+.target-ns b { color: var(--fg); font-weight: 600; }
+.target-ns .link { margin-left: auto; background: none; border: 0; padding: 2px 4px;
+  cursor: pointer; color: var(--accent); font-size: 12px; border-radius: 5px; }
+.target-ns .link:hover { text-decoration: underline; }
 /* ---- 抽屉 ---- */
 .drawer-bar { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
 .drawer-bar .src { font-size: 12px; color: var(--muted); }

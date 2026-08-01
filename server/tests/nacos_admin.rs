@@ -679,3 +679,125 @@ async fn admin_writes_are_audited_and_operator_is_denied() {
         assert_eq!(s, 403, "{path} 应拒绝 operator");
     }
 }
+
+#[tokio::test]
+async fn one_step_grant_creates_role_and_reports_user_access() {
+    // Nacos 的模型是 用户→角色→权限,三张表分开看根本答不出「这个账号能动哪些命名空间」。
+    // 一步授权:选账号 + 命名空间 + 读写,缺角色自动建并绑定,再赋权到 <ns>:*:*。
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let n = mock().await;
+    let id = cluster(&app, &admin, &n.addr).await;
+
+    let (s, _) = app
+        .post(
+            &format!("/nacos/clusters/{id}/users"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "password": "p" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+
+    // 新账号:没有角色、没有权限
+    let (s, v) = app.get(&format!("/nacos/clusters/{id}/users/dev1/access"), &admin, "admin-dev").await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["global_admin"], false);
+    assert!(v["roles"].as_array().unwrap().is_empty());
+    assert!(v["grants"].as_array().unwrap().is_empty());
+
+    // 一步授权:自动建角色并绑定
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "namespace_id": "dev-ns", "action": "rw" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["created_role"], true);
+    assert_eq!(v["role"], "dev1-role");
+    assert_eq!(v["resource"], "dev-ns:*:*");
+
+    let (_, v) = app.get(&format!("/nacos/clusters/{id}/users/dev1/access"), &admin, "admin-dev").await;
+    assert_eq!(v["roles"], json!(["dev1-role"]));
+    assert_eq!(v["grants"][0]["namespace_id"], "dev-ns");
+    assert_eq!(v["grants"][0]["action"], "rw");
+    assert_eq!(v["grants"][0]["role"], "dev1-role");
+
+    // 第二次授权复用同一个角色,不再重复创建
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "namespace_id": "", "action": "r" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["created_role"], false);
+    assert_eq!(v["resource"], ":*:*", "public 的资源串首段为空");
+    let (_, v) = app.get(&format!("/nacos/clusters/{id}/users/dev1/access"), &admin, "admin-dev").await;
+    assert_eq!(v["grants"].as_array().unwrap().len(), 2);
+    assert_eq!(n.state.lock().unwrap().roles.iter().filter(|(r, _)| r == "dev1-role").count(), 1);
+
+    // 动作白名单
+    let (s, e) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "namespace_id": "x", "action": "delete" }),
+        )
+        .await;
+    assert_eq!(s, 400);
+    assert!(e["error"].as_str().unwrap().contains("r / w / rw"), "{e}");
+
+    // 收回
+    let (s, _) = app
+        .delete(
+            &format!("/nacos/clusters/{id}/grant?username=dev1&namespace_id=dev-ns&action=rw"),
+            &admin,
+            "admin-dev",
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (_, v) = app.get(&format!("/nacos/clusters/{id}/users/dev1/access"), &admin, "admin-dev").await;
+    assert_eq!(v["grants"].as_array().unwrap().len(), 1);
+
+    // 全局管理员:如实标出,并拒绝无意义的逐空间授权
+    let (_, v) = app.get(&format!("/nacos/clusters/{id}/users/nacos/access"), &admin, "admin-dev").await;
+    assert_eq!(v["global_admin"], true);
+    let (s, e) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "nacos", "namespace_id": "dev-ns", "action": "rw" }),
+        )
+        .await;
+    assert_eq!(s, 400);
+    assert!(e["error"].as_str().unwrap().contains("全局管理员"), "{e}");
+
+    // 审计只记「真的打到远端」的操作:两次成功的授权。
+    // 参数校验(动作非法)和前置判定(全局管理员无需授权)在本地就拦下了,
+    // 一个远端请求都没发出去,记进审计只会稀释真正的操作痕迹。
+    let (_, rows) = app.get("/audit?action=nacos_grant", &admin, "admin-dev").await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|r| r["result"] == "ok"));
+    assert!(rows.iter().any(|r| r["payload"].as_str().unwrap().contains("dev1-role")));
+
+    // operator 不得授权
+    let op = app.operator().await;
+    let (s, _) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant"),
+            &op,
+            "op-dev",
+            json!({ "username": "dev1", "namespace_id": "x", "action": "r" }),
+        )
+        .await;
+    assert_eq!(s, 403);
+}
