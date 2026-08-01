@@ -68,6 +68,7 @@ const menuOptions = computed(() => {
   if (auth.isAdmin) items.splice(1, 0,
     { label: '用户与权限', key: '/users' },
     { label: '资产管理', key: '/assets' },
+    { label: 'Nacos 管理', key: '/nacos' },
     { label: '授权规则', key: '/access' },
     { label: '执行模板', key: '/templates' },
     { label: labelWithBadge('审批确认', pendingCount.value), key: '/approvals' });

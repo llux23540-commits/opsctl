@@ -46,6 +46,21 @@ html, body, #app { height: 100%; margin: 0; }
   --fg-2: #aab2bf;
 }
 
+/* Chrome 自动填充会强行给 input 刷上 rgb(232,240,254) 的浅底,在深色主题里就是
+   一块白斑。UA 那层背景改不掉,但可以把它裁剪到文字轮廓上 —— 于是露出的仍是
+   naive-ui 输入框自己的底色,不用去猜合成后的具体色值。 */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active,
+textarea:-webkit-autofill,
+select:-webkit-autofill {
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: var(--fg);
+  caret-color: var(--fg);
+}
+
 /* slim rounded scrollbars on the dark theme (native square bars look off) */
 * {
   scrollbar-width: thin;                      /* Firefox */

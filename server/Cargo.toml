@@ -36,6 +36,4 @@ base64 = "0.22.1"
 hmac = "0.12.1"
 sha1 = "0.10.6"
 data-encoding = "2.6.0"
-
-[dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

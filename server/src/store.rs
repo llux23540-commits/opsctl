@@ -244,6 +244,60 @@ pub struct NotificationRow {
     pub read: i64,
 }
 
+/// One registered Nacos cluster (connection + vault credential handle).
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct NacosClusterRow {
+    pub id: String,
+    pub name: String,
+    /// dev | test | prod | ''
+    pub env: String,
+    /// One or more `host:port` (or `http://host:port`) entries, comma separated.
+    pub server_addr: String,
+    /// Nacos context path, normally `/nacos` (2.x standalone can be `/`).
+    pub context_path: String,
+    /// Tenant id; empty = the `public` namespace.
+    pub namespace: String,
+    pub username: String,
+    /// Vault-encrypted password — never serialized to clients.
+    #[serde(skip_serializing)]
+    pub secret: String,
+    pub status: String,
+    pub note: String,
+    pub created_at: i64,
+}
+
+/// A named set of config items used to bootstrap a cluster.
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct NacosTemplateRow {
+    pub id: String,
+    pub name: String,
+    pub note: String,
+    /// json: `[{data_id,group,type,content}]`
+    pub items: String,
+    pub created_at: i64,
+}
+
+/// One recorded "初始化配置" run against a cluster.
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct NacosRunRow {
+    pub id: String,
+    pub cluster_id: String,
+    pub cluster_name: String,
+    pub template_id: String,
+    pub template_name: String,
+    pub operator_id: String,
+    pub operator_email: String,
+    pub namespace: String,
+    /// ok | partial | fail
+    pub status: String,
+    pub total: i64,
+    pub ok_count: i64,
+    pub dry_run: i64,
+    /// json: `[{data_id,group,status,message}]`
+    pub items: String,
+    pub ts: i64,
+}
+
 impl Store {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = SqlitePoolOptions::new()
@@ -410,6 +464,42 @@ impl Store {
             link TEXT NOT NULL DEFAULT '',
             ts INTEGER NOT NULL,
             read INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS nacos_clusters (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            env TEXT NOT NULL DEFAULT '',                  -- dev | test | prod
+            server_addr TEXT NOT NULL DEFAULT '',          -- host:port 列表,逗号分隔
+            context_path TEXT NOT NULL DEFAULT '/nacos',
+            namespace TEXT NOT NULL DEFAULT '',            -- tenant id,空=public
+            username TEXT NOT NULL DEFAULT '',
+            secret TEXT NOT NULL DEFAULT '',               -- 金库加密的密码
+            status TEXT NOT NULL DEFAULT 'enabled',        -- enabled | disabled
+            note TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS nacos_config_templates (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            items TEXT NOT NULL DEFAULT '[]',              -- json: [{data_id,group,type,content}]
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS nacos_init_runs (
+            id TEXT PRIMARY KEY,
+            cluster_id TEXT NOT NULL,
+            cluster_name TEXT NOT NULL DEFAULT '',
+            template_id TEXT NOT NULL DEFAULT '',
+            template_name TEXT NOT NULL DEFAULT '',
+            operator_id TEXT NOT NULL DEFAULT '',
+            operator_email TEXT NOT NULL DEFAULT '',
+            namespace TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'ok',             -- ok | partial | fail
+            total INTEGER NOT NULL DEFAULT 0,
+            ok_count INTEGER NOT NULL DEFAULT 0,
+            dry_run INTEGER NOT NULL DEFAULT 0,
+            items TEXT NOT NULL DEFAULT '[]',              -- json: 每条配置的结果
+            ts INTEGER NOT NULL
         );
         "#;
         // execute() runs a single statement; split on ';' for the batch.
@@ -930,12 +1020,23 @@ impl Store {
     }
 
     // ---- notifications ----
+
+    /// Keep at most this many notifications per user; the UI only ever lists the
+    /// newest 100, so older rows are dead weight (a long-lived dev box piles up
+    /// hundreds of 新设备登录 alerts).
+    const NOTIFICATION_KEEP: i64 = 200;
+
     #[allow(clippy::too_many_arguments)]
     pub async fn push_notification(
         &self, user_id: &str, kind: &str, title: &str, body: &str, link: &str, ts: i64,
     ) -> Result<()> {
         sqlx::query("INSERT INTO notifications (id,user_id,kind,title,body,link,ts,read) VALUES (?,?,?,?,?,?,?,0)")
             .bind(uuid::Uuid::new_v4().to_string()).bind(user_id).bind(kind).bind(title).bind(body).bind(link).bind(ts)
+            .execute(&self.pool).await?;
+        sqlx::query(
+            "DELETE FROM notifications WHERE user_id = ?1 AND id NOT IN \
+             (SELECT id FROM notifications WHERE user_id = ?1 ORDER BY ts DESC, rowid DESC LIMIT ?2)")
+            .bind(user_id).bind(Self::NOTIFICATION_KEEP)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -1129,6 +1230,112 @@ impl Store {
              ORDER BY jt.ts DESC LIMIT ?3";
         Ok(sqlx::query_as::<_, NodeHistoryRow>(sql)
             .bind(asset_id).bind(operator).bind(limit).fetch_all(&self.pool).await?)
+    }
+}
+
+/// Nacos 管理:集群注册表 / 配置模板 / 初始化记录.
+impl Store {
+    pub async fn list_nacos_clusters(&self) -> Result<Vec<NacosClusterRow>> {
+        Ok(sqlx::query_as::<_, NacosClusterRow>(
+            "SELECT * FROM nacos_clusters ORDER BY env, name")
+            .fetch_all(&self.pool).await?)
+    }
+
+    pub async fn get_nacos_cluster(&self, id: &str) -> Result<Option<NacosClusterRow>> {
+        Ok(sqlx::query_as::<_, NacosClusterRow>("SELECT * FROM nacos_clusters WHERE id = ?")
+            .bind(id).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn create_nacos_cluster(&self, c: &NacosClusterRow) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO nacos_clusters (id,name,env,server_addr,context_path,namespace,username,secret,status,note,created_at) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&c.id).bind(&c.name).bind(&c.env).bind(&c.server_addr).bind(&c.context_path)
+            .bind(&c.namespace).bind(&c.username).bind(&c.secret).bind(&c.status).bind(&c.note)
+            .bind(c.created_at)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Update; empty `secret` keeps the stored one.
+    pub async fn update_nacos_cluster(&self, c: &NacosClusterRow) -> Result<()> {
+        if c.secret.is_empty() {
+            sqlx::query(
+                "UPDATE nacos_clusters SET name=?,env=?,server_addr=?,context_path=?,namespace=?,\
+                 username=?,status=?,note=? WHERE id=?")
+                .bind(&c.name).bind(&c.env).bind(&c.server_addr).bind(&c.context_path)
+                .bind(&c.namespace).bind(&c.username).bind(&c.status).bind(&c.note).bind(&c.id)
+                .execute(&self.pool).await?;
+        } else {
+            sqlx::query(
+                "UPDATE nacos_clusters SET name=?,env=?,server_addr=?,context_path=?,namespace=?,\
+                 username=?,secret=?,status=?,note=? WHERE id=?")
+                .bind(&c.name).bind(&c.env).bind(&c.server_addr).bind(&c.context_path)
+                .bind(&c.namespace).bind(&c.username).bind(&c.secret).bind(&c.status).bind(&c.note)
+                .bind(&c.id)
+                .execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn delete_nacos_cluster(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM nacos_clusters WHERE id = ?").bind(id).execute(&self.pool).await?;
+        sqlx::query("DELETE FROM nacos_init_runs WHERE cluster_id = ?").bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn list_nacos_templates(&self) -> Result<Vec<NacosTemplateRow>> {
+        Ok(sqlx::query_as::<_, NacosTemplateRow>(
+            "SELECT * FROM nacos_config_templates ORDER BY created_at DESC")
+            .fetch_all(&self.pool).await?)
+    }
+
+    pub async fn get_nacos_template(&self, id: &str) -> Result<Option<NacosTemplateRow>> {
+        Ok(sqlx::query_as::<_, NacosTemplateRow>(
+            "SELECT * FROM nacos_config_templates WHERE id = ?")
+            .bind(id).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn save_nacos_template(&self, t: &NacosTemplateRow) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO nacos_config_templates (id,name,note,items,created_at) VALUES (?,?,?,?,?)")
+            .bind(&t.id).bind(&t.name).bind(&t.note).bind(&t.items).bind(t.created_at)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn delete_nacos_template(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM nacos_config_templates WHERE id = ?")
+            .bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn insert_nacos_run(&self, r: &NacosRunRow) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO nacos_init_runs (id,cluster_id,cluster_name,template_id,template_name,\
+             operator_id,operator_email,namespace,status,total,ok_count,dry_run,items,ts) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&r.id).bind(&r.cluster_id).bind(&r.cluster_name).bind(&r.template_id)
+            .bind(&r.template_name).bind(&r.operator_id).bind(&r.operator_email).bind(&r.namespace)
+            .bind(&r.status).bind(r.total).bind(r.ok_count).bind(r.dry_run).bind(&r.items).bind(r.ts)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Init history; `cluster_id=""` = every cluster.
+    pub async fn list_nacos_runs(&self, cluster_id: &str, limit: i64) -> Result<Vec<NacosRunRow>> {
+        Ok(sqlx::query_as::<_, NacosRunRow>(
+            "SELECT * FROM nacos_init_runs WHERE (?1 = '' OR cluster_id = ?1) \
+             ORDER BY ts DESC, rowid DESC LIMIT ?2")
+            .bind(cluster_id).bind(limit).fetch_all(&self.pool).await?)
+    }
+
+    /// Most recent *applied* run (dry runs don't count as an initialization).
+    pub async fn last_nacos_run(&self, cluster_id: &str) -> Result<Option<NacosRunRow>> {
+        Ok(sqlx::query_as::<_, NacosRunRow>(
+            "SELECT * FROM nacos_init_runs WHERE cluster_id = ? AND dry_run = 0 \
+             ORDER BY ts DESC, rowid DESC LIMIT 1")
+            .bind(cluster_id).fetch_optional(&self.pool).await?)
     }
 }
 

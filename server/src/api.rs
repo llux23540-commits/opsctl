@@ -16,7 +16,7 @@ use crate::state::{now_secs, AppState};
 use crate::store::{AssetRow, RuleRow, SystemUserRow, TagRow};
 use crate::{rbac, sql, ssh};
 
-fn is_admin(u: &AuthUser) -> bool {
+pub(crate) fn is_admin(u: &AuthUser) -> bool {
     u.role == Role::Admin
 }
 

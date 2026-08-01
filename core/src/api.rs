@@ -130,3 +130,89 @@ pub struct DecideRequest {
 pub struct ApiError {
     pub error: String,
 }
+
+// ---- Nacos 管理 ----
+
+/// Default Nacos config group when the caller doesn't set one.
+pub fn default_nacos_group() -> String {
+    "DEFAULT_GROUP".into()
+}
+fn default_nacos_type() -> String {
+    "properties".into()
+}
+
+/// One config item to publish into a Nacos cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NacosConfigItem {
+    pub data_id: String,
+    #[serde(default = "default_nacos_group")]
+    pub group: String,
+    /// properties | yaml | json | text | xml | html (Nacos `type`).
+    #[serde(default = "default_nacos_type", rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub content: String,
+}
+
+/// `POST /nacos/clusters/{id}/init` — 初始化配置.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NacosInitRequest {
+    /// Config template to apply; its items are used when `items` is empty.
+    #[serde(default)]
+    pub template_id: Option<String>,
+    /// Ad-hoc items (override the template's when present).
+    #[serde(default)]
+    pub items: Vec<NacosConfigItem>,
+    /// `${name}` substitutions applied to every item's dataId/group/content.
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, String>,
+    /// Namespace (tenant) override; `None` = the cluster's configured one.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Overwrite an already-present dataId (default: leave it untouched).
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Resolve + diff only, publish nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Per-item outcome of one init run. `status` is one of
+/// `created` | `updated` | `skipped` | `fail`, prefixed with `would_` in a dry run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NacosItemResult {
+    pub data_id: String,
+    pub group: String,
+    pub status: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// `POST /nacos/clusters/{id}/init` response (also the stored run record).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NacosInitResult {
+    pub run_id: String,
+    pub cluster_id: String,
+    pub cluster_name: String,
+    pub namespace: String,
+    /// ok | partial | fail
+    pub status: String,
+    pub total: i64,
+    pub ok_count: i64,
+    pub dry_run: bool,
+    pub items: Vec<NacosItemResult>,
+}
+
+/// One member of a Nacos cluster, as reported by the cluster itself or probed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NacosNodeView {
+    pub address: String,
+    /// UP / DOWN / SUSPICIOUS (Nacos states) or `unreachable` when probed.
+    pub state: String,
+    #[serde(default)]
+    pub version: String,
+    pub ok: bool,
+    pub latency_ms: i64,
+    #[serde(default)]
+    pub message: String,
+}

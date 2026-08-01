@@ -10,6 +10,10 @@ Rust workspace:`core`(共享模型/DTO)、`server`(opsctl-vault,axum + SQLite,�
 - **授权**:资产授权规则引擎(主体 × 资产[子树/标签/集] × 系统账号 × 动作[ssh/sql] × 有效期)。
 - **凭据金库**:系统账号密码/密钥用口令派生密钥(argon2 + ChaCha20-Poly1305)**加密静态存储**;启动口令解封,封存态拒绝取用凭据。
 - **执行**:服务端代理 SSH(russh)/ SQL(sqlite);命中「需审批」规则则挂起,管理员放行/驳回(支持批量),全程逐目标审计。
+- **Nacos 管理**(admin):登记多套 Nacos 集群 → 总览页实时拉取成员节点(`/v2|v1/core/cluster/nodes`,不可用时降级为地址探活);
+  「初始化配置」按模板 + `${变量}` 逐条下发(`/v1/cs/configs`),默认不覆盖已存在的 dataId,支持试运行;
+  集群详情页直连 Nacos 管理面 API 做**命名空间 / 账号 / 角色绑定 / 赋权**(1.x·2.x 走 `/v1/auth/*` + `/v1/console/namespaces`,
+  3.x 自动切 `/v3/auth/*` + `/v3/console/core/namespace`);集群口令进金库加密,每次写操作落审计。
 - **其它屏**:执行模板(变量代入)、消息中心(站内通知)、审计(筛选+详情+CSV/JSON 导出)、设置(个人/会话撤销/金库/Telegram·Git 配置)。
 
 > 演示态(未接外部系统,UI 标注):Telegram bot、真实 git push、mysql/postgres。
@@ -29,7 +33,7 @@ cd web && npm run dev                                        # 前端
 
 ## 测试
 ```bash
-cargo test -p opsctl-server      # 32 个 API 集成测试(临时 sqlite,隔离并行)
+cargo test -p opsctl-server      # 76 个 API 集成测试(临时 sqlite,隔离并行;Nacos 用内置 mock 驱动)
 ```
 
 ## 部署
@@ -39,3 +43,4 @@ cargo test -p opsctl-server      # 32 个 API 集成测试(临时 sqlite,隔离�
 - `jsonwebtoken` 10 → 启用 `rust_crypto` provider。
 - `russh` → `default-features=false, features=["ring","flate2","rsa"]`(避开 aws-lc-rs/NASM)。
 - sqlx 仅编译 `sqlite`(mysql/pg 待接);SQLite 单写入,横向扩容需换 Postgres。
+- `reqwest` 关掉默认特性(仅 `json`):Nacos 走 http,不引入 aws-lc-rs/NASM 依赖;暂不支持 https 与 IPv6 字面量地址。

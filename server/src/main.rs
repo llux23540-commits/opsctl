@@ -33,11 +33,19 @@ async fn main() -> anyhow::Result<()> {
     // plaintext secrets); otherwise the server starts sealed.
     let vault = Arc::new(Vault::new());
     match &cfg.vault.passphrase {
-        Some(p) if !p.is_empty() => {
-            vault.unseal(p, &store).await?;
-            let n = vault.migrate_plaintext(&store).await?;
-            tracing::info!(migrated = n, "vault unsealed at startup");
-        }
+        Some(p) if !p.is_empty() => match vault.unseal(p, &store).await {
+            Ok(()) => {
+                let n = vault.migrate_plaintext(&store).await?;
+                tracing::info!(migrated = n, "vault unsealed at startup");
+            }
+            // A wrong passphrase must not take the platform down: sealed is a
+            // supported state (login / audit / history / 只读视图 all work) and an
+            // admin can unseal from 设置 → 凭据金库.
+            Err(e) => tracing::error!(
+                error = %e,
+                "vault unseal FAILED — starting SEALED; fix OPSCTL_VAULT__PASSPHRASE or unseal via 设置 → 凭据金库"
+            ),
+        },
         _ => tracing::warn!("vault SEALED — set OPSCTL_VAULT__PASSPHRASE or POST /api/vault/unseal"),
     }
 

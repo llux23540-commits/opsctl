@@ -1,5 +1,88 @@
 # opsctl 对齐原型 · 进度记录
 
+> **2026-08-01 Nacos 管理面轮次(已完成)**:接入 Nacos 的**命名空间 / 账号 / 角色绑定 / 赋权** API。
+> 契约全部按 alibaba/nacos 源码核对(tag 2.3.2,并交叉比对 1.4.7 / 2.2.3 / 3.0.0),不靠博客:
+> 控制器不在 console 模块,而在 `plugin-default-impl/nacos-default-auth-plugin/.../controller/`。
+> **A 版本口味探测**:先打 `/v3/auth/user/list`,通(含 401/403)判为 3.x 走 `/v3/auth/*`+`/v3/console/core/namespace`,
+> 否则走 `/v1/auth/*`+`/v1/console/namespaces`;v1 列表恒带 `search=accurate`(2.x 是 mapping 谓词,缺了根本匹配不到
+> handler,1.4.x 则直接忽略)—— 一套调用形状通吃 1.x/2.x。
+> **B 响应形状三不统一**(最容易解析错的地方,已分别处理):账号/角色/权限**列表是裸 `Page<T>`**(无信封)、
+> 写操作是 `RestResult{code:200}`、命名空间增删改是**裸 `true`/`false`**(HTTP 200 也可能是 false),
+> 失败则是 **HTTP 400 + 纯文本**;v3 统一 `{code:0,...}`。`check_write` 只认 code,不解析人类可读串
+> (1.4.x 放 message、2.2+ 放 data)。
+> **C 参数名陷阱**:v1 create=`customNamespaceId`、v1 edit=`namespace`+`namespaceShowName`、v2=`namespaceId`、
+> v3 create 又变回 `customNamespaceId` —— 各写各的,不复用。
+> **D 服务端规则前置**:`ROLE_ADMIN` 不允许创建、public(id 为空串或字面量)不允许删除、动作只放行 `r|w|rw`、
+> 命名空间 id/名称按 Nacos 同款正则本地先校验(避免 v1 只回一个分辨不出原因的 `false`);
+> 账号列表返回的 **bcrypt 哈希一律剥掉**,绝不下发。
+> **E 资源串**:`<namespaceId>:<group>:<type>/<name>`,分隔符 `:`、通配 `*`,public 首段为空(`:*:*`);
+> UI 用下拉拼装并实时预览,不让人手敲。赋权前角色必须已存在(服务端 `role X not found!`,集群还有 ~15s 传播延迟),
+> 页面已明示。
+> 落地:`server/src/nacos.rs` 新增 Flavor 探测 + 15 个客户端函数 + 14 个处理器(全 admin-only,写操作落审计
+> `nacos_ns_*`/`nacos_user_*`/`nacos_role_*`/`nacos_perm_*`);新页面 `web/src/views/NacosCluster.vue`
+> (路由 `/nacos/:id`,四个 Tab);`dev/mock-nacos.mjs` 同步补齐这些端点(含 v3 一律 404 以便探测回落)。
+> **顺带修**:reqwest 的 Display 只给最外层,排障时看不到真因 —— 加 `why()` 走 source 链,
+> 这才定位到用户那台 Nacos 不可达的真正原因是 **GlassWire 给 opsctl-server.exe 下了出站 Block 规则
+> (os error 10013 WSAEACCES)**,不是 Nacos 或代码问题。
+> 验证:`cargo test -p opsctl-server` **76 全绿**(新增 4 项,mock 精确复刻上述三种响应形状 + 纯文本 400);
+> 浏览器实测四个 Tab:建命名空间 `dev-ns`、建账号 `dev1`、绑角色 `dev`、赋权 `dev-ns:*:*` `rw` 全部生效,
+> 列表回读一致,public 行禁用编辑/删除。
+
+> **2026-08-01 输入框修复轮次(已完成)**:「登记 Nacos 集群」里用户名/密码输入框白底 —— 根因是
+> **Chrome 自动填充**,不是主题问题:浏览器把保存的 **opsctl 登录口令**(admin/admin)当成登录表单灌进了
+> 这两个框,并强制刷上 UA 的 `rgb(232,240,254)` 浅底(实测 `:-webkit-autofill` 命中,其余输入框全是
+> `rgba(0,0,0,0)`)。所以这不只是难看:不留神点保存,平台自己的登录口令就会被当成 Nacos 集群口令加密入库。
+> **A 挡住误灌**:Nacos 集群表单的用户名/密码加 `:input-props`(`name=nacos-cluster-user|secret`、
+> `autocomplete=off|new-password`);排查发现 **资产管理 → 系统账号** 新建框同样被灌入 admin/admin
+> (SSH 凭据,危害相同),一并加 `sys-account-user|secret`。设置页改密码、用户重置密码实测不触发,未动。
+> **B 兜底样式**(`App.vue` 全局):UA 那层背景改不掉,用 `-webkit-background-clip: text` 把它裁到文字轮廓,
+> 露出的仍是 naive-ui 输入框自己的底色,不用猜合成色值;配 `-webkit-text-fill-color/caret-color` 用 `--fg`。
+> 登录页的自动填充是合理的,保留功能、只修观感。
+> 验证(Playwright 有头 Chromium,真实自动填充场景):Nacos/系统账号两个表单 `autofilled=false`、
+> 背景 `rgba(0,0,0,0)`;输入纯数字与混合字符后仍为深色;密码框眼睛切明文后 `type=text`、底色不变;
+> 登录页仍被自动填充(`autofilled=true`)但已渲染成深色;`v-model` 未被 `input-props` 影响 ——
+> 填 nacos/nacos-pass 点「测试连通」得「连通正常 · 2/3 节点在线 · 13 ms」;
+> 生产包(8443 单二进制读 `web/dist`)已确认含该 CSS 规则与四个 autocomplete 属性。
+> 未做:Firefox 的标准 `:autofill` 选择器(本机无 Firefox,不验证不发)。
+
+> **2026-08-01 补充轮次(跑起来后的调整,已完成)**:用现有 `data/opsctl.db` 实跑一遍发现并修掉四处——
+> **A 启动被错口令打死**(`main.rs` 里 `vault.unseal(..)?` 会让进程直接 exit 1;而封存是受支持的常态,
+> 登录/审计/执行记录/只读视图都能用。改为记 ERROR 后**以封存态继续启动**,提示去 设置 → 凭据金库 解封。
+> 该库的金库盐口令已不可考,正是这个场景)、
+> **B Nacos 页对封存态零提示**(原来只有点保存后的一条 toast)。页面加载即查 `/vault/status`,
+> 封存时在页头下方常驻警示条(说明哪些操作会失败 + 「前往解封」直达 `/settings#vault`),
+> 卡片上给带鉴权的集群加「需解封」pill(`has_secret` 已由接口返回)、
+> **C 设置页锚点只认 `#sessions`**:改成 `{sessions, vault}` 映射;并修好一个存量 bug——卡片内容是异步载入的,
+> 首帧 `scrollIntoView` 会落空(`#vault` 实测停在 top=1444),改为 nextTick + 400ms 各滚一次,
+> 现在 `#vault`/`#sessions` 都能落点、
+> **D 通知无上限堆积**(admin 已有 185 条,几乎全是「新设备登录」,铃铛长期 99+)。
+> `push_notification` 插入后按用户裁剪到最新 200 条(UI 本来也只列 100)。
+> 验证:`cargo test -p opsctl-server` **72 全绿**;实跑确认错口令下服务正常起并打 ERROR 日志、
+> 封存条与 pill 渲染、`#vault` 落点 top=143(容器已滚到底)、连打 22 次登录后 admin 通知稳定在 200 条;
+> 十个路由逐个走查无 console error。
+
+> **2026-08-01 轮次(已完成)**:新增 **Nacos 管理** 模块(admin-only,菜单/路由 `/nacos`)——
+> **A 集群总览**(`nacos_clusters` 表:名称/环境/地址列表/上下文路径/命名空间/账号 + 金库加密口令/启停/备注;
+> 卡片网格展示所有集群,进页并发拉取实时节点:`POST /v1/auth/login` 取 accessToken →
+> `GET /v2/core/cluster/nodes`,失败回退 `/v1/core/cluster/nodes`,再失败降级为逐地址
+> `/v1/console/health/readiness` 探活并把文案改成「地址可达」以免夸大;地址支持 `host`/`host:port`/完整 URL,
+> 缺端口补 8848)、
+> **B 配置初始化**(`nacos_config_templates` 模板 = 一组 `{dataId,group,type,content}`,支持 `${变量}` 占位;
+> 下发前 `GET /v1/cs/configs` 判存在:默认跳过已存在项、`overwrite` 才覆盖、内容一致也跳过;
+> `POST /v1/cs/configs` 表单发布;`dry_run` 只出 `would_*` 预演不写远端;变量缺失该项直接 fail,不写半成品)、
+> **C 留痕**(`nacos_init_runs` 逐条结果 + 集群卡片「最近初始化」+ 记录 Tab 与详情抽屉;同时写 audit
+> `nacos_init` / `nacos_init_dry_run`,金库封存时带口令的集群拒绝建/用)。
+> 端点:`/api/nacos/clusters`(CRUD)、`/{id}/nodes`、`/{id}/configs`、`/{id}/init`、`/probe`、`/templates`、`/runs`。
+> 前端 `web/src/views/Nacos.vue` + 复用组件 `components/Icon.vue`(内联 SVG,替代 emoji 图标)、
+> `components/NacosConfigItems.vue`;沿用既有深色 + 青色 token,按 ui-ux-pro-max 规则做:状态「图标+文案+颜色」
+> 三重编码、等宽地址/dataId + tabular-nums、初始化抽屉渐进式披露(来源→变量→策略→结果)、
+> 覆盖开关二次确认、空状态给下一步动作、焦点环与 reduced-motion。
+> 依赖:`reqwest` 从 dev-dependencies 提为正式依赖(仍 `default-features=false, features=["json"]`,不引入 TLS/NASM)。
+> 验证:`cargo test -p opsctl-server` **72 全绿**(新增 8 项集成测试 + 3 项单元测试,远端用内置 mock Nacos 按
+> v1/v2 文档响应形状驱动:鉴权/节点/建-跳过-覆盖/试运行/模板变量/错口令/封存);
+> 浏览器实测(临时 mock Nacos 进程 + 真实服务端):登记集群→测试连通 2/3 节点→建模板→变量代入→试运行(0 写入)
+> →执行(mock 侧确认 2 次 publish)→重跑得「跳过」→已有配置列表→初始化记录与详情;900px 无横向滚动。
+
 > **2026-07-16 轮次(已完成)**:三项体验改进——
 > **A git 文件「打开所在位置」**(文件查看接口加 abs_path/exists(模板视图仅 admin 可见);新端点 POST /settings/git/reveal:admin-only,`resolve_in_work_dir` 严格校验路径不可越出 work_dir,Windows `explorer /select,` 定位文件、mac `open -R`、Linux `xdg-open`;get_git 返回 work_dir_abs;资产/模板文件弹窗显示磁盘位置+「打开所在位置」(未同步禁用+提示),设置页 Git 卡片「打开文件夹」+绝对路径展示)、
 > **B 头像菜单「我的会话与设备」锚点直达**(跳 `/settings#sessions`,hash 路由下 vue-router 正常解析 route.hash;Settings 会话卡片 scrollIntoView 平滑滚动 + 1.8s 高亮描边动画)、

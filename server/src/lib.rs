@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod git;
 pub mod jobs;
+pub mod nacos;
 pub mod rbac;
 pub mod sql;
 pub mod ssh;
@@ -94,7 +95,51 @@ pub fn build_router(state: AppState) -> Router {
         .route("/templates/{id}", post(api::save_template).delete(api::delete_template))
         .route("/templates/{id}/file", get(api::template_file_view))
         .route("/backup/status", get(api::backup_status))
-        .route("/backup/run", post(api::backup_run));
+        .route("/backup/run", post(api::backup_run))
+        // ---- Nacos 管理(集群总览 + 配置初始化,均 admin-only)----
+        .route("/nacos/clusters", get(nacos::list_clusters).post(nacos::create_cluster))
+        .route(
+            "/nacos/clusters/{id}",
+            put(nacos::update_cluster).delete(nacos::delete_cluster),
+        )
+        .route("/nacos/clusters/{id}/nodes", get(nacos::cluster_nodes))
+        .route("/nacos/clusters/{id}/configs", get(nacos::cluster_configs))
+        .route("/nacos/clusters/{id}/init", post(nacos::init_cluster))
+        .route("/nacos/probe", post(nacos::probe_cluster))
+        .route("/nacos/templates", get(nacos::list_templates).post(nacos::save_template))
+        .route("/nacos/templates/{id}", axum::routing::delete(nacos::delete_template))
+        .route("/nacos/runs", get(nacos::list_runs))
+        // ---- Nacos 管理面:命名空间 / 账号 / 角色 / 权限(直连 Nacos Open API)----
+        .route(
+            "/nacos/clusters/{id}/namespaces",
+            get(nacos::list_namespaces_api)
+                .post(nacos::create_namespace_api)
+                .put(nacos::update_namespace_api),
+        )
+        .route(
+            "/nacos/clusters/{id}/namespaces/{ns}",
+            axum::routing::delete(nacos::delete_namespace_api),
+        )
+        .route(
+            "/nacos/clusters/{id}/users",
+            get(nacos::list_users_api).post(nacos::create_user_api).put(nacos::reset_user_api),
+        )
+        .route(
+            "/nacos/clusters/{id}/users/{username}",
+            axum::routing::delete(nacos::delete_user_api),
+        )
+        .route(
+            "/nacos/clusters/{id}/roles",
+            get(nacos::list_roles_api)
+                .post(nacos::bind_role_api)
+                .delete(nacos::unbind_role_api),
+        )
+        .route(
+            "/nacos/clusters/{id}/permissions",
+            get(nacos::list_permissions_api)
+                .post(nacos::grant_permission_api)
+                .delete(nacos::revoke_permission_api),
+        );
 
     Router::new()
         .route("/health", get(health))

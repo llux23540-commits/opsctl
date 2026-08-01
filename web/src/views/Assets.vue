@@ -331,9 +331,14 @@ const tagCols = [
       <n-form v-if="accountForm" label-placement="left" :label-width="100">
         <n-form-item label="名称"><n-input v-model:value="accountForm.name" placeholder="如 web-ssh" /></n-form-item>
         <n-form-item label="类型"><n-select v-model:value="accountForm.kind" :options="accountKindOpts" /></n-form-item>
-        <n-form-item label="登录用户名"><n-input v-model:value="accountForm.username" /></n-form-item>
+        <!-- 目标机器的登录账号,不是本平台账号:挡掉浏览器灌入 opsctl 的登录口令 -->
+        <n-form-item label="登录用户名">
+          <n-input v-model:value="accountForm.username"
+            :input-props="{ name: 'sys-account-user', autocomplete: 'off' }" />
+        </n-form-item>
         <n-form-item label="密码/密钥">
           <n-input v-model:value="accountForm.secret" type="password" show-password-on="click"
+            :input-props="{ name: 'sys-account-secret', autocomplete: 'new-password' }"
             :placeholder="accountForm.id ? '留空则不修改' : ''" />
         </n-form-item>
       </n-form>

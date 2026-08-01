@@ -8,19 +8,26 @@ import { useAuth } from '../store/auth';
 const message = useMessage();
 const auth = useAuth();
 
-// deep-link: /settings#sessions (avatar menu「我的会话与设备」) scrolls to the
-// sessions card and flashes it so the landing spot is obvious.
+// deep-link: /settings#sessions(头像菜单「我的会话与设备」)、/settings#vault
+// (其它页面「前往解封」)滚动到对应卡片并闪一下,让落点显而易见。
 const route = useRoute();
 const sessionsCard = ref(null);
-const flashSessions = ref(false);
+const vaultCard = ref(null);
+const flashKey = ref('');
 async function scrollToHash() {
-  if (route.hash !== '#sessions') return;
-  await nextTick();
-  const el = sessionsCard.value?.$el || sessionsCard.value;
-  if (!el) return;
-  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  flashSessions.value = true;
-  setTimeout(() => { flashSessions.value = false; }, 1800);
+  const key = route.hash.replace('#', '');
+  const target = { sessions: sessionsCard, vault: vaultCard }[key];
+  if (!target) return;
+  flashKey.value = key;
+  // 卡片内容(会话表 / git 配置 / 金库状态)都是异步载入的,首帧滚动会落空,
+  // 所以内容稳定后再滚一次。
+  for (const delay of [0, 400]) {
+    await nextTick();
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    const el = target.value?.$el || target.value;
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  setTimeout(() => { flashKey.value = ''; }, 1800);
 }
 watch(() => route.hash, scrollToHash);
 
@@ -284,13 +291,14 @@ onMounted(() => { loadProfile(); loadSessions(); loadGit(); loadFlags(); loadVau
 
     <!-- 活跃会话 -->
     <n-card id="sessions" ref="sessionsCard" title="活跃会话 / 设备" size="small"
-      :class="{ 'flash-target': flashSessions }">
+      :class="{ 'flash-target': flashKey === 'sessions' }">
       <template #header-extra><n-button size="tiny" @click="loadSessions">刷新</n-button></template>
       <n-data-table :columns="sessionCols" :data="sessions" size="small" :bordered="false" />
     </n-card>
 
     <!-- 凭据金库 (admin) -->
-    <n-card v-if="auth.isAdmin" title="凭据金库(加密静态存储)" size="small">
+    <n-card v-if="auth.isAdmin" id="vault" ref="vaultCard" title="凭据金库(加密静态存储)" size="small"
+      :class="{ 'flash-target': flashKey === 'vault' }">
       <n-space vertical :size="12">
         <n-space align="center">
           <span>状态:</span>
