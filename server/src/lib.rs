@@ -103,7 +103,12 @@ pub fn build_router(state: AppState) -> Router {
             put(nacos::update_cluster).delete(nacos::delete_cluster),
         )
         .route("/nacos/clusters/{id}/nodes", get(nacos::cluster_nodes))
-        .route("/nacos/clusters/{id}/configs", get(nacos::cluster_configs))
+        .route(
+            "/nacos/clusters/{id}/configs",
+            get(nacos::cluster_configs).delete(nacos::delete_config_api),
+        )
+        .route("/nacos/clusters/{id}/configs/detail", get(nacos::config_detail))
+        .route("/nacos/clusters/{id}/sync", post(nacos::sync_cluster))
         .route("/nacos/clusters/{id}/init", post(nacos::init_cluster))
         .route("/nacos/probe", post(nacos::probe_cluster))
         .route("/nacos/templates", get(nacos::list_templates).post(nacos::save_template))

@@ -371,6 +371,97 @@ async fn publish_config(
     }
 }
 
+/// 删除一条配置(补齐配置面的增删改查)。
+async fn delete_config(
+    base: &str,
+    token: &Option<String>,
+    tenant: &str,
+    data_id: &str,
+    group: &str,
+) -> Result<(), String> {
+    let url = format!("{base}/v1/cs/configs");
+    let mut params = common_params(token, tenant);
+    params.push(("dataId", data_id.to_string()));
+    params.push(("group", group.to_string()));
+    let resp = HTTP
+        .delete(&url)
+        .query(&params)
+        .send()
+        .await
+        .map_err(|e| format!("删除配置失败:{}", why(&e)))?;
+    let code = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    if code == 200 && body.trim().eq_ignore_ascii_case("true") {
+        Ok(())
+    } else {
+        Err(format!("删除配置被拒绝(HTTP {code} {})", truncate_msg(body.trim())))
+    }
+}
+
+/// 把整个命名空间的配置拉回本地(同步)。
+///
+/// 列表接口在不同版本上对 `content` 的态度不一致:有的把内容一起返回,有的只给元数据。
+/// 所以先用列表拿全量清单,再对缺内容的逐条 GET 补齐 —— 保证同步下来的模板是完整可回放的,
+/// 而不是一堆空壳。
+pub async fn pull_configs(conn: &NacosConn) -> Result<Vec<NacosConfigItem>, String> {
+    let base = conn.bases.first().ok_or("集群没有配置任何地址")?.clone();
+    let token = access_token(&base, &conn.username, &conn.password).await?;
+    let url = format!("{base}/v1/cs/configs");
+
+    let mut out: Vec<NacosConfigItem> = Vec::new();
+    let page_size = 200;
+    for page_no in 1..=50 {
+        let mut params = common_params(&token, &conn.namespace);
+        params.push(("search", "accurate".into()));
+        params.push(("dataId", String::new()));
+        params.push(("group", String::new()));
+        params.push(("pageNo", page_no.to_string()));
+        params.push(("pageSize", page_size.to_string()));
+        let resp = HTTP
+            .get(&url)
+            .query(&params)
+            .send()
+            .await
+            .map_err(|e| format!("拉取配置失败:{}", why(&e)))?;
+        if !resp.status().is_success() {
+            return Err(format!("拉取配置返回 HTTP {}", resp.status().as_u16()));
+        }
+        let v: Value = resp.json().await.map_err(|e| format!("配置列表无法解析:{e}"))?;
+        let items = v.get("pageItems").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+        let got = items.len();
+        for i in items {
+            out.push(NacosConfigItem {
+                data_id: str_at(&i, "dataId"),
+                group: {
+                    let g = str_at(&i, "group");
+                    if g.is_empty() { default_nacos_group() } else { g }
+                },
+                kind: {
+                    let t = str_at(&i, "type");
+                    if t.is_empty() { "text".into() } else { t }
+                },
+                content: str_at(&i, "content"),
+            });
+        }
+        let pages = v.get("pagesAvailable").and_then(|p| p.as_i64()).unwrap_or(1);
+        if got < page_size as usize || page_no >= pages {
+            break;
+        }
+    }
+
+    // 列表没带内容的,逐条补齐
+    for item in out.iter_mut() {
+        if item.content.is_empty() {
+            if let Ok(Some(c)) =
+                get_config(&base, &token, &conn.namespace, &item.data_id, &item.group).await
+            {
+                item.content = c;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Existing configs in the namespace (compact listing for the UI).
 async fn list_configs(
     conn: &NacosConn,
@@ -1008,10 +1099,12 @@ fn resolve_item(
 
 /// Publish every item. `overwrite=false` leaves an existing dataId untouched;
 /// `dry_run=true` only reports what would happen.
+/// `literal=true` 跳过 `${}` 代入,按原文下发(同步回来的真实配置走这条路)。
 pub async fn init_configs(
     conn: &NacosConn,
     items: &[NacosConfigItem],
     vars: &BTreeMap<String, String>,
+    literal: bool,
     overwrite: bool,
     dry_run: bool,
 ) -> Vec<NacosItemResult> {
@@ -1047,16 +1140,20 @@ pub async fn init_configs(
     let mark = |s: &str| if dry_run { format!("would_{s}") } else { s.to_string() };
 
     for raw in items {
-        let item = match resolve_item(raw, vars) {
-            Ok(i) => i,
-            Err((i, missing)) => {
-                out.push(NacosItemResult {
-                    data_id: i.data_id,
-                    group: i.group,
-                    status: "fail".into(),
-                    message: format!("变量未提供:{}", missing.join(", ")),
-                });
-                continue;
+        let item = if literal {
+            raw.clone()
+        } else {
+            match resolve_item(raw, vars) {
+                Ok(i) => i,
+                Err((i, missing)) => {
+                    out.push(NacosItemResult {
+                        data_id: i.data_id,
+                        group: i.group,
+                        status: "fail".into(),
+                        message: format!("变量未提供:{}", missing.join(", ")),
+                    });
+                    continue;
+                }
             }
         };
         if item.data_id.trim().is_empty() {
@@ -1399,6 +1496,159 @@ pub async fn cluster_configs(
     }
 }
 
+#[derive(Deserialize)]
+pub struct ConfigRef {
+    pub data_id: String,
+    #[serde(default = "default_nacos_group")]
+    pub group: String,
+    /// 覆盖集群默认命名空间
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+/// 覆盖命名空间(同步 / 单条读写都可能指定别的 tenant)。
+fn with_namespace(mut conn: NacosConn, ns: &Option<String>) -> NacosConn {
+    if let Some(n) = ns.as_ref().filter(|n| !n.trim().is_empty()) {
+        conn.namespace = n.trim().to_string();
+    }
+    conn
+}
+
+/// `GET /nacos/clusters/{id}/configs/detail` — 取一条配置的正文(供预览/对比)。
+pub async fn config_detail(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConfigRef>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    let c = load_cluster(&st, &id).await?;
+    let conn = with_namespace(conn_for(&st, &c)?, &q.namespace);
+    let base = conn.bases.first().ok_or_else(|| AppError::BadRequest("集群没有配置任何地址".into()))?;
+    let token = access_token(base, &conn.username, &conn.password)
+        .await
+        .map_err(AppError::BadRequest)?;
+    match get_config(base, &token, &conn.namespace, &q.data_id, &q.group).await {
+        Ok(Some(content)) => Ok(Json(json!({
+            "ok": true, "data_id": q.data_id, "group": q.group,
+            "namespace": conn.namespace, "bytes": content.len(), "content": content
+        }))),
+        Ok(None) => Ok(Json(json!({ "ok": false, "message": "配置不存在" }))),
+        Err(e) => Ok(Json(json!({ "ok": false, "message": e }))),
+    }
+}
+
+/// `DELETE /nacos/clusters/{id}/configs` — 删除一条配置(admin,落审计)。
+pub async fn delete_config_api(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConfigRef>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    let c = load_cluster(&st, &id).await?;
+    let conn = with_namespace(conn_for(&st, &c)?, &q.namespace);
+    let base = conn
+        .bases
+        .first()
+        .ok_or_else(|| AppError::BadRequest("集群没有配置任何地址".into()))?
+        .clone();
+    let token = access_token(&base, &conn.username, &conn.password)
+        .await
+        .map_err(AppError::BadRequest)?;
+    let out = delete_config(&base, &token, &conn.namespace, &q.data_id, &q.group).await;
+    let payload = json!({ "data_id": q.data_id, "group": q.group, "namespace": conn.namespace });
+    done(&st, &user, &c, "nacos_config_delete", payload, out).await
+}
+
+#[derive(Deserialize)]
+pub struct SyncReq {
+    /// 落地成模板的名字;留空则自动生成
+    #[serde(default)]
+    pub template_name: String,
+    /// 覆盖集群默认命名空间
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// 只看不存
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST /nacos/clusters/{id}/sync` — 把远端命名空间的配置整体同步回来,
+/// 存成一个可直接用于「初始化」的配置模板(于是 dev→test 的克隆变成两步)。
+pub async fn sync_cluster(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SyncReq>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    let c = load_cluster(&st, &id).await?;
+    let conn = with_namespace(conn_for(&st, &c)?, &req.namespace);
+    let ns = conn.namespace.clone();
+
+    let items = pull_configs(&conn).await.map_err(AppError::BadRequest)?;
+    let summary: Vec<Value> = items
+        .iter()
+        .map(|i| {
+            json!({
+                "data_id": i.data_id, "group": i.group, "type": i.kind,
+                "bytes": i.content.len(), "empty": i.content.is_empty(),
+            })
+        })
+        .collect();
+    let total = items.len() as i64;
+
+    if req.dry_run {
+        return Ok(Json(json!({
+            "ok": true, "dry_run": true, "total": total, "namespace": ns,
+            "template_id": Value::Null, "template_name": "", "items": summary
+        })));
+    }
+    if items.is_empty() {
+        return Err(AppError::BadRequest("该命名空间没有配置可同步".into()));
+    }
+
+    let name = if req.template_name.trim().is_empty() {
+        format!("{} · {} 同步", c.name, if ns.is_empty() { "public" } else { &ns })
+    } else {
+        req.template_name.trim().to_string()
+    };
+    let tpl_id = Uuid::new_v4().to_string();
+    st.store
+        .save_nacos_template(&NacosTemplateRow {
+            id: tpl_id.clone(),
+            name: name.clone(),
+            note: format!(
+                "从「{}」命名空间 {} 同步,共 {} 条",
+                c.name,
+                if ns.is_empty() { "public".into() } else { ns.clone() },
+                total
+            ),
+            items: serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
+            created_at: now_secs(),
+            // 同步下来的是真实配置,里面的 ${} 属于应用,回放时必须原样发出去
+            literal: 1,
+        })
+        .await
+        .map_err(AppError::Internal)?;
+
+    audit_admin(
+        &st,
+        &user,
+        &c,
+        "nacos_sync",
+        json!({ "namespace": ns, "total": total, "template_id": tpl_id, "template_name": name }),
+        "ok",
+    )
+    .await;
+
+    Ok(Json(json!({
+        "ok": true, "dry_run": false, "total": total, "namespace": ns,
+        "template_id": tpl_id, "template_name": name, "items": summary
+    })))
+}
+
 /// `POST /nacos/clusters/{id}/init` — 初始化配置(模板或即席条目)。
 pub async fn init_cluster(
     user: AuthUser,
@@ -1412,9 +1662,11 @@ pub async fn init_cluster(
         return Err(AppError::BadRequest("集群已停用,无法初始化".into()));
     }
 
-    // items: explicit ones win, otherwise the template's
-    let (items, template_id, template_name) = if !req.items.is_empty() {
-        (req.items.clone(), String::new(), String::new())
+    // items: explicit ones win, otherwise the template's.
+    // `literal` 模板(同步回来的真实配置)按原文下发 —— 里面的 `${...}` 是应用自己的
+    // 占位符,不是 opsctl 的模板变量,拿去代入只会让整批回放失败。
+    let (items, template_id, template_name, mut literal) = if !req.items.is_empty() {
+        (req.items.clone(), String::new(), String::new(), false)
     } else if let Some(tid) = req.template_id.clone().filter(|t| !t.is_empty()) {
         let t = st
             .store
@@ -1424,12 +1676,16 @@ pub async fn init_cluster(
             .ok_or_else(|| AppError::BadRequest("配置模板不存在".into()))?;
         let parsed: Vec<NacosConfigItem> = serde_json::from_str(&t.items)
             .map_err(|e| AppError::BadRequest(format!("模板配置项无法解析:{e}")))?;
-        (parsed, t.id, t.name)
+        (parsed, t.id, t.name, t.literal != 0)
     } else {
-        (Vec::new(), String::new(), String::new())
+        (Vec::new(), String::new(), String::new(), false)
     };
     if items.is_empty() {
         return Err(AppError::BadRequest("没有要初始化的配置项".into()));
+    }
+    // 调用方可以显式覆盖(substitute=false 强制原文,true 强制代入)
+    if let Some(sub) = req.substitute {
+        literal = !sub;
     }
 
     let mut conn = conn_for(&st, &c)?;
@@ -1437,7 +1693,9 @@ pub async fn init_cluster(
         conn.namespace = ns.trim().to_string();
     }
 
-    let results = init_configs(&conn, &items, &req.vars, req.overwrite, req.dry_run).await;
+    let empty_vars = BTreeMap::new();
+    let vars = if literal { &empty_vars } else { &req.vars };
+    let results = init_configs(&conn, &items, vars, literal, req.overwrite, req.dry_run).await;
     let total = results.len() as i64;
     let ok_count = results.iter().filter(|r| r.status != "fail").count() as i64;
     let status = if ok_count == total {
@@ -1524,6 +1782,9 @@ pub struct SaveNacosTemplate {
     pub note: String,
     #[serde(default)]
     pub items: Vec<NacosConfigItem>,
+    /// true = 按原文下发,不做 `${}` 变量代入
+    #[serde(default)]
+    pub literal: bool,
 }
 
 pub async fn save_template(
@@ -1557,6 +1818,7 @@ pub async fn save_template(
             note: req.note,
             items: serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()),
             created_at,
+            literal: i64::from(req.literal),
         })
         .await
         .map_err(AppError::Internal)?;

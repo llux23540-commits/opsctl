@@ -257,28 +257,14 @@ function statePill(state, ok) {
   ]);
 }
 
-// ---- 已有配置抽屉 ----
+// ---- 集群管理入口 ----
 
-const configsDrawer = reactive({ show: false, cluster: null, loading: false, data: null });
-async function openConfigs(c) {
-  configsDrawer.cluster = c;
-  configsDrawer.show = true;
-  configsDrawer.loading = true;
-  configsDrawer.data = null;
-  try {
-    configsDrawer.data = await api.nacosConfigs(c.id, { page_size: 200 });
-  } catch (e) {
-    configsDrawer.data = { ok: false, items: [], message: e?.response?.data?.error || '读取失败' };
-  } finally {
-    configsDrawer.loading = false;
-  }
+/// 进集群管理页:命名空间 / 配置(含同步)/ 账号 / 角色绑定 / 权限 都在那儿。
+/// 卡片上原来的「已有配置」抽屉是只读列表,已被管理页的「配置」Tab 完全覆盖
+/// (多了正文预览、删除、同步为模板),所以直接换成入口,不留两套。
+function openManage(c) {
+  router.push(`/nacos/${c.id}`);
 }
-
-const configColumns = [
-  { title: 'dataId', key: 'data_id', render: (r) => h('span', { class: 'mono' }, r.data_id) },
-  { title: 'group', key: 'group', width: 170, render: (r) => h('span', { class: 'mono' }, r.group) },
-  { title: '格式', key: 'type', width: 110 },
-];
 
 // ---- 初始化抽屉 ----
 
@@ -327,7 +313,16 @@ const initItems = computed(() => {
   return t ? itemsOf(t) : [];
 });
 
+/// 同步回来的模板是「原文下发」:里面的 ${...} 是应用自己的占位符(Spring 之类),
+/// 不能当成 opsctl 的模板变量去要人填,否则整批回放全部失败。
+const initLiteral = computed(() => {
+  if (init.mode === 'custom') return false;
+  const t = templates.value.find((x) => x.id === init.templateId);
+  return !!(t && t.literal);
+});
+
 const initVarNames = computed(() => {
+  if (initLiteral.value) return [];
   const found = new Set();
   for (const it of initItems.value) {
     for (const field of [it.data_id, it.group, it.content]) {
@@ -630,7 +625,9 @@ onMounted(async () => {
         <div v-else class="grid">
           <article v-for="c in clusters" :key="c.id" class="card" :class="{ off: c.status === 'disabled' }">
             <div class="card-hd">
-              <h3 :title="c.name">{{ c.name }}</h3>
+              <h3 :title="`${c.name} · 点击进入集群管理`">
+                <button class="name-link" type="button" @click="openManage(c)">{{ c.name }}</button>
+              </h3>
               <span v-if="c.env" class="pill" :class="`env-${c.env}`">{{ c.env }}</span>
               <span v-if="c.status === 'disabled'" class="pill pill-muted">已停用</span>
               <span v-if="vaultSealed && c.has_secret" class="pill pill-warn" title="集群口令在金库里,封存态取不到">
@@ -690,13 +687,17 @@ onMounted(async () => {
               <n-button size="small" type="primary" :disabled="c.status === 'disabled'" @click="openInit(c)">
                 <Icon name="play" :size="14" style="margin-right:6px" /> 初始化配置
               </n-button>
+              <!-- 命名空间 / 账号 / 角色 / 权限 / 配置 都在集群管理页,这里是唯一入口 -->
+              <n-button size="small" secondary @click="openManage(c)">
+                <Icon name="list" :size="14" style="margin-right:6px" /> 集群管理
+              </n-button>
               <n-button size="small" quaternary @click="openNodes(c)">
                 <Icon name="server" :size="14" style="margin-right:6px" /> 节点
               </n-button>
-              <n-button size="small" quaternary @click="openConfigs(c)">
-                <Icon name="database" :size="14" style="margin-right:6px" /> 已有配置
-              </n-button>
             </div>
+            <p class="manage-hint">
+              集群管理:命名空间 · 配置(含同步) · 账号 · 角色绑定 · 权限
+            </p>
           </article>
         </div>
       </n-tab-pane>
@@ -896,28 +897,7 @@ onMounted(async () => {
       </n-drawer-content>
     </n-drawer>
 
-    <!-- ============ 已有配置抽屉 ============ -->
-    <n-drawer v-model:show="configsDrawer.show" :width="640" placement="right">
-      <n-drawer-content :title="`${configsDrawer.cluster?.name || ''} · 已有配置`" closable>
-        <n-alert v-if="configsDrawer.data && !configsDrawer.data.ok" type="error" :bordered="false" style="margin-bottom:12px">
-          {{ configsDrawer.data.message || '读取失败' }}
-        </n-alert>
-        <p class="drawer-bar">
-          <span class="src">
-            命名空间 <b class="mono">{{ configsDrawer.cluster?.namespace || 'public' }}</b>
-            共 <b class="num">{{ configsDrawer.data?.total || 0 }}</b> 项
-          </span>
-        </p>
-        <n-data-table
-          :columns="configColumns"
-          :data="configsDrawer.data?.items || []"
-          :loading="configsDrawer.loading"
-          :bordered="false"
-          :scroll-x="560"
-          size="small"
-        />
-      </n-drawer-content>
-    </n-drawer>
+    <!-- 已有配置抽屉已移除:改由集群管理页的「配置」Tab 承载(带正文预览/删除/同步) -->
 
     <!-- ============ 初始化抽屉 ============ -->
     <n-drawer v-model:show="init.show" :width="760" placement="right">
@@ -943,6 +923,11 @@ onMounted(async () => {
               {{ it.data_id }} <span class="dim">· {{ it.group }} · {{ it.type }}</span>
             </li>
           </ul>
+          <p v-if="initLiteral" class="literal-note">
+            <Icon name="check" :size="13" />
+            该模板由「同步」生成,按<b>原文</b>下发 —— 配置里的
+            <code>${...}</code> 是应用自己的占位符,不做变量代入。
+          </p>
         </section>
 
         <!-- 2. 变量(仅在模板含占位符时出现:渐进式披露) -->
@@ -1120,6 +1105,12 @@ onMounted(async () => {
 .card-hd { display: flex; align-items: center; gap: 8px; }
 .card-hd h3 { flex: 1; min-width: 0; margin: 0; font-size: 15px; font-weight: 620; color: var(--fg);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.name-link { all: unset; cursor: pointer; display: block; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  border-radius: 4px; transition: color .15s ease; }
+.name-link:hover { color: var(--accent); text-decoration: underline; }
+.name-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.manage-hint { margin: -2px 0 0; font-size: 11.5px; color: var(--muted); }
 .hd-ops { display: flex; gap: 2px; margin-left: 4px; }
 .meta { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 .meta li { font-size: 12px; color: var(--fg-2); }
@@ -1197,6 +1188,10 @@ onMounted(async () => {
 .preview { list-style: none; margin: 10px 0 0; padding: 10px; border-radius: 8px;
   background: var(--bg); font-size: 12px; color: var(--fg-2); max-height: 168px; overflow: auto; }
 .preview li { padding: 1px 0; }
+.literal-note { display: flex; align-items: center; gap: 6px; margin: 8px 0 0;
+  font-size: 12px; color: var(--success); }
+.literal-note b { color: var(--fg); font-weight: 600; }
+.literal-note code { font-family: ui-monospace, Consolas, monospace; color: var(--fg-2); }
 .res-sum { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-radius: 8px;
   background: var(--bg); font-size: 12.5px; }
 .kv-grid { display: grid; grid-template-columns: 92px 1fr 92px 1fr; gap: 8px 12px;

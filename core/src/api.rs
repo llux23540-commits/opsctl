@@ -172,6 +172,10 @@ pub struct NacosInitRequest {
     /// Overwrite an already-present dataId (default: leave it untouched).
     #[serde(default)]
     pub overwrite: bool,
+    /// 强制覆盖模板的「原文下发」标记:`Some(false)` = 按原文,`Some(true)` = 做变量代入。
+    /// 留空则跟随模板自身设置。
+    #[serde(default)]
+    pub substitute: Option<bool>,
     /// Resolve + diff only, publish nothing.
     #[serde(default)]
     pub dry_run: bool,

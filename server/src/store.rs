@@ -275,6 +275,10 @@ pub struct NacosTemplateRow {
     /// json: `[{data_id,group,type,content}]`
     pub items: String,
     pub created_at: i64,
+    /// 1 = 按原文下发,不做 `${}` 变量代入。
+    /// 从远端同步回来的配置里那些 `${...}` 是应用自己的占位符(Spring 等),
+    /// 当成 opsctl 模板变量去要求填值只会让回放失败。
+    pub literal: i64,
 }
 
 /// One recorded "初始化配置" run against a cluster.
@@ -483,7 +487,8 @@ impl Store {
             name TEXT NOT NULL,
             note TEXT NOT NULL DEFAULT '',
             items TEXT NOT NULL DEFAULT '[]',              -- json: [{data_id,group,type,content}]
-            created_at INTEGER NOT NULL DEFAULT 0
+            created_at INTEGER NOT NULL DEFAULT 0,
+            literal INTEGER NOT NULL DEFAULT 0            -- 1 = 原文下发,不做变量代入
         );
         CREATE TABLE IF NOT EXISTS nacos_init_runs (
             id TEXT PRIMARY KEY,
@@ -559,6 +564,11 @@ impl Store {
         let _ = sqlx::query("ALTER TABLE approvals ADD COLUMN quick TEXT NOT NULL DEFAULT 'console'")
             .execute(&self.pool)
             .await;
+        let _ = sqlx::query(
+            "ALTER TABLE nacos_config_templates ADD COLUMN literal INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
         Ok(())
     }
 
@@ -1298,8 +1308,10 @@ impl Store {
 
     pub async fn save_nacos_template(&self, t: &NacosTemplateRow) -> Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO nacos_config_templates (id,name,note,items,created_at) VALUES (?,?,?,?,?)")
+            "INSERT OR REPLACE INTO nacos_config_templates (id,name,note,items,created_at,literal) \
+             VALUES (?,?,?,?,?,?)")
             .bind(&t.id).bind(&t.name).bind(&t.note).bind(&t.items).bind(t.created_at)
+            .bind(t.literal)
             .execute(&self.pool).await?;
         Ok(())
     }

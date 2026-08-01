@@ -1,5 +1,29 @@
 # opsctl 对齐原型 · 进度记录
 
+> **2026-08-01 同步 + 真机联调轮次(已完成)**:
+> **A 真机为什么连不上**(纠正上一轮结论):不是「专门拦了 opsctl-server.exe」,而是本机**出站默认 Block**
+> (`DefaultOutboundAction=Block`,三个 profile 全是),只有拿到放行规则的程序才出得去 —— curl / chrome / node
+> 都有 Allow 规则,新编译的 exe 没有。用 `server/examples/probe.rs`(同一套 reqwest、独立 exe)做了可证伪实验:
+> 无规则时 `ERR 3ms os error 10013`,GlassWire 补上 Allow 后**同一个二进制** `OK 200 119ms`。
+> `opsctl-server.exe` 另有一条显式 Block(Block 优先于 Allow),换 exe 路径可绕开 ——
+> 本地改用 `target/debug/opsctl-vault.exe` 起服务即打通真机。根治仍需删掉那条 Block 规则。
+> **B 真机验证**(Nacos **2.5.1** 单节点 `10.42.0.25:8848`):节点(`/v2` 不可用,`/v1` 降级生效)、
+> 7 个命名空间、账号、角色、权限、配置全部读到。
+> **C 新增「同步」**:`POST /nacos/clusters/{id}/sync` 把远端整个命名空间拉回存成配置模板
+> (列表接口不给正文的版本逐条回查补齐),支持 `dry_run`;配套 `GET /configs/detail`(正文预览)、
+> `DELETE /configs`(删除,落审计)。真机拉回 25 条 / 46,679 字节。
+> **D 真机数据暴露的缺陷 + 修复**:线上配置本来就含 `${mysql8.jdbc.url}`、`${MYSQL_ROOT_PASSWORD:...}` 这类
+> **应用自己的**占位符,被当成 opsctl 模板变量后回放 **16/25** 失败。改为模板增加 `literal` 列,
+> 同步产生的模板一律 `literal=1` 原文下发;`NacosInitRequest` 加 `substitute` 可显式覆盖;
+> UI 在原文模板下隐藏「变量取值」步骤并说明原因。修后回放 **25/25**(9 新建 + 16 跳过),
+> 抽查三条源/目标**逐字节一致**。
+> **E 补上缺失的入口**:命名空间/账号/角色/权限 那个页面(`/nacos/:id`)此前只能手敲 URL —— 集群卡片上
+> 没有任何链接。现在卡片名可点、并加「集群管理」按钮 + 一行能力说明;原来的「已有配置」只读抽屉删掉,
+> 由管理页的「配置」Tab 承接(多了正文预览 / 删除 / 同步),不留两套。
+> 验证:`cargo test -p opsctl-server` **80 全绿**(新增 4);Playwright 全链路实测:卡片→集群管理→
+> 五个 Tab 全部读到真机数据(7 命名空间 / 21 配置 / 账号 / 角色 / 权限空态)→ 配置正文预览 →
+> 同步(试运行 + 落库)→ 登记目标集群 → 选原文快照 → 执行初始化 25/25。
+
 > **2026-08-01 Nacos 管理面轮次(已完成)**:接入 Nacos 的**命名空间 / 账号 / 角色绑定 / 赋权** API。
 > 契约全部按 alibaba/nacos 源码核对(tag 2.3.2,并交叉比对 1.4.7 / 2.2.3 / 3.0.0),不靠博客:
 > 控制器不在 console 模块,而在 `plugin-default-impl/nacos-default-auth-plugin/.../controller/`。

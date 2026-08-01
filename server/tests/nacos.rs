@@ -22,6 +22,8 @@ struct MockState {
     configs: HashMap<String, (String, String)>,
     logins: usize,
     publishes: usize,
+    /// 列表接口是否隐藏正文(复现只给元数据的版本)
+    hide_list_content: bool,
 }
 
 type Shared = Arc<Mutex<MockState>>;
@@ -52,7 +54,10 @@ async fn mock_nacos() -> MockNacos {
         .route("/nacos/v1/auth/login", axum::routing::post(login))
         .route("/nacos/v1/console/health/readiness", get(readiness))
         .route("/nacos/v2/core/cluster/nodes", get(nodes))
-        .route("/nacos/v1/cs/configs", get(get_configs).post(post_config))
+        .route(
+            "/nacos/v1/cs/configs",
+            get(get_configs).post(post_config).delete(delete_config),
+        )
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -126,8 +131,11 @@ async fn get_configs(
                 let _ = parts.next();
                 let group = parts.next().unwrap_or_default();
                 let data_id = parts.next().unwrap_or_default();
+                // 有的 Nacos 版本列表接口只给元数据不给正文,用这个开关复现,
+                // 验证 opsctl 会逐条回查补齐
+                let body = if guard.hide_list_content { String::new() } else { content.clone() };
                 json!({ "id": "1", "dataId": data_id, "group": group,
-                        "content": content, "type": kind, "appName": "" })
+                        "content": body, "type": kind, "appName": "" })
             })
             .collect();
         return Json(json!({
@@ -161,6 +169,24 @@ async fn post_config(
     guard.configs.insert(key, (get("content"), get("type")));
     guard.publishes += 1;
     "true".into_response()
+}
+
+async fn delete_config(
+    State(st): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !authed(&q) {
+        return (axum::http::StatusCode::FORBIDDEN, "no token").into_response();
+    }
+    let key = format!(
+        "{}|{}|{}",
+        q.get("tenant").cloned().unwrap_or_default(),
+        q.get("group").cloned().unwrap_or_default(),
+        q.get("dataId").cloned().unwrap_or_default()
+    );
+    let removed = st.lock().unwrap().configs.remove(&key).is_some();
+    if removed { "true" } else { "false" }.into_response()
 }
 
 // ---- helpers ----
@@ -541,4 +567,256 @@ async fn sealed_vault_blocks_credentialed_clusters() {
     let id = v["id"].as_str().unwrap().to_string();
     let (s, _) = app.get(&format!("/nacos/clusters/{id}/nodes"), &admin, "admin-dev").await;
     assert_eq!(s, 200);
+}
+
+#[tokio::test]
+async fn sync_pulls_namespace_into_a_replayable_template() {
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let nacos = mock_nacos().await;
+    let id = register_cluster(&app, &admin, &nacos.addr).await;
+
+    // 先在远端放三条配置(经由初始化写入,顺带保证两条链路一致)
+    let (s, _) = app
+        .post(
+            &format!("/nacos/clusters/{id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "items": [
+                { "data_id": "a.properties", "group": "G1", "type": "properties", "content": "k=1" },
+                { "data_id": "b.yaml", "group": "G1", "type": "yaml", "content": "k: 2" },
+                { "data_id": "c.json", "group": "G2", "type": "json", "content": "{\"k\":3}" }
+            ] }),
+        )
+        .await;
+    assert_eq!(s, 200);
+
+    // 试运行:只报告,不落库
+    let (s, v) = app
+        .post(&format!("/nacos/clusters/{id}/sync"), &admin, "admin-dev", json!({ "dry_run": true }))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["total"], 3);
+    assert!(v["template_id"].is_null());
+    assert!(v["items"].as_array().unwrap().iter().all(|i| i["empty"] == false));
+    let (_, tpls) = app.get("/nacos/templates", &admin, "admin-dev").await;
+    assert!(tpls.as_array().unwrap().is_empty(), "试运行不应产生模板:{tpls}");
+
+    // 真同步:落成模板
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/sync"),
+            &admin,
+            "admin-dev",
+            json!({ "template_name": "生产基线快照" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["template_name"], "生产基线快照");
+    let tpl_id = v["template_id"].as_str().unwrap().to_string();
+
+    // 模板内容必须是完整可回放的(带正文),而不是空壳
+    let (_, tpls) = app.get("/nacos/templates", &admin, "admin-dev").await;
+    let t = tpls.as_array().unwrap().iter().find(|t| t["id"] == tpl_id.as_str()).unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_str(t["items"].as_str().unwrap()).unwrap();
+    assert_eq!(items.len(), 3);
+    let a = items.iter().find(|i| i["data_id"] == "a.properties").unwrap();
+    assert_eq!(a["group"], "G1");
+    assert_eq!(a["type"], "properties");
+    assert_eq!(a["content"], "k=1");
+
+    // 把这份快照回放到「另一个集群」——真正的 dev→test 克隆路径
+    let other = mock_nacos().await;
+    let other_id = register_cluster(&app, &admin, &other.addr).await;
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{other_id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "template_id": tpl_id }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["total"], 3);
+    assert_eq!(other.config("", "G1", "a.properties").unwrap(), "k=1");
+    assert_eq!(other.config("", "G2", "c.json").unwrap(), "{\"k\":3}");
+
+    // 审计留痕
+    let (_, rows) = app.get("/audit?action=nacos_sync", &admin, "admin-dev").await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["payload"].as_str().unwrap().contains("生产基线快照"));
+}
+
+#[tokio::test]
+async fn sync_backfills_content_when_list_omits_it() {
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let nacos = mock_nacos().await;
+    let id = register_cluster(&app, &admin, &nacos.addr).await;
+    let (s, _) = app
+        .post(
+            &format!("/nacos/clusters/{id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "items": [{ "data_id": "only.yaml", "group": "G", "content": "deep: value" }] }),
+        )
+        .await;
+    assert_eq!(s, 200);
+
+    // 让列表接口只回元数据 —— opsctl 必须逐条回查把正文补齐
+    nacos.state.lock().unwrap().hide_list_content = true;
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/sync"),
+            &admin,
+            "admin-dev",
+            json!({ "template_name": "补齐验证" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["items"][0]["empty"], false, "正文应已补齐:{v}");
+    assert_eq!(v["items"][0]["bytes"], 11);
+
+    let (_, tpls) = app.get("/nacos/templates", &admin, "admin-dev").await;
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(tpls[0]["items"].as_str().unwrap()).unwrap();
+    assert_eq!(items[0]["content"], "deep: value");
+}
+
+#[tokio::test]
+async fn config_detail_and_delete_round_trip() {
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let nacos = mock_nacos().await;
+    let id = register_cluster(&app, &admin, &nacos.addr).await;
+    let (s, _) = app
+        .post(
+            &format!("/nacos/clusters/{id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "items": [{ "data_id": "app.yaml", "group": "G", "content": "port: 8080" }] }),
+        )
+        .await;
+    assert_eq!(s, 200);
+
+    let (s, v) = app
+        .get(
+            &format!("/nacos/clusters/{id}/configs/detail?data_id=app.yaml&group=G"),
+            &admin,
+            "admin-dev",
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["content"], "port: 8080");
+    assert_eq!(v["bytes"], 10);
+
+    // 不存在的配置要如实说,而不是给空串
+    let (s, v) = app
+        .get(
+            &format!("/nacos/clusters/{id}/configs/detail?data_id=nope.yaml&group=G"),
+            &admin,
+            "admin-dev",
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["message"], "配置不存在");
+
+    let (s, _) = app
+        .delete(
+            &format!("/nacos/clusters/{id}/configs?data_id=app.yaml&group=G"),
+            &admin,
+            "admin-dev",
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert!(nacos.config("", "G", "app.yaml").is_none(), "远端应已删除");
+
+    let (_, rows) = app.get("/audit?action=nacos_config_delete", &admin, "admin-dev").await;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+
+    // operator 不得触碰
+    let op = app.operator().await;
+    let (s, _) = app
+        .delete(&format!("/nacos/clusters/{id}/configs?data_id=x&group=G"), &op, "op-dev")
+        .await;
+    assert_eq!(s, 403);
+}
+
+#[tokio::test]
+async fn synced_template_replays_app_placeholders_verbatim() {
+    // 真机数据暴露过的坑:线上配置里本来就有 ${mysql8.jdbc.url} 这类 **应用自己的**
+    // 占位符。同步回来的模板若还按 opsctl 模板变量去代入,就会要求填值并整批失败。
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let src = mock_nacos().await;
+    let src_id = register_cluster(&app, &admin, &src.addr).await;
+
+    let raw = "spring:\n  datasource:\n    url: ${mysql8.jdbc.url}\n    name: ${spring.application.name}\n";
+    // 即席条目默认会做变量代入,所以铺底数据要显式声明按原文发
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{src_id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "substitute": false,
+                    "items": [{ "data_id": "db.yml", "group": "G", "type": "yaml", "content": raw }] }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["status"], "ok", "{v}");
+    assert_eq!(src.config("", "G", "db.yml").unwrap(), raw);
+
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{src_id}/sync"),
+            &admin,
+            "admin-dev",
+            json!({ "template_name": "含占位符的真实配置" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let tpl = v["template_id"].as_str().unwrap().to_string();
+
+    // 模板被标记为「原文下发」
+    let (_, tpls) = app.get("/nacos/templates", &admin, "admin-dev").await;
+    let t = tpls.as_array().unwrap().iter().find(|t| t["id"] == tpl.as_str()).unwrap();
+    assert_eq!(t["literal"], 1, "同步产生的模板必须是原文模式:{t}");
+
+    // 回放到另一个集群:一个变量都不给,也必须全成功且内容一字不改
+    let dst = mock_nacos().await;
+    let dst_id = register_cluster(&app, &admin, &dst.addr).await;
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{dst_id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "template_id": tpl }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"], "ok", "原文模板不应因缺变量而失败:{v}");
+    assert_eq!(v["items"][0]["status"], "created");
+    assert_eq!(dst.config("", "G", "db.yml").unwrap(), raw);
+
+    // 显式要求代入时,才回到「变量未提供」的行为
+    let dst2 = mock_nacos().await;
+    let dst2_id = register_cluster(&app, &admin, &dst2.addr).await;
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{dst2_id}/init"),
+            &admin,
+            "admin-dev",
+            json!({ "template_id": tpl, "substitute": true }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["status"], "fail");
+    assert!(v["items"][0]["message"].as_str().unwrap().contains("mysql8.jdbc.url"), "{v}");
+    assert!(dst2.config("", "G", "db.yml").is_none());
 }

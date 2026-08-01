@@ -1,5 +1,5 @@
 <script setup>
-// Nacos 集群管理:命名空间 / 账号 / 角色绑定 / 权限赋权。
+// Nacos 集群管理:命名空间 / 配置 / 账号 / 角色绑定 / 权限赋权。
 // 与「Nacos 管理」总览页不同,这一页的每个动作都直接打到远端 Nacos 集群,
 // 而不是 opsctl 自己的库。因此:
 //   1) 破坏性动作(删命名空间 / 删账号 / 解绑 / 收回)一律二次确认;
@@ -22,12 +22,13 @@ const tab = ref('namespaces');
 const loading = reactive({
   cluster: false,
   namespaces: false,
+  configs: false,
   users: false,
   roles: false,
   perms: false,
 });
-/// 角色 / 权限两张表按需加载:一进页面就打四次远端有点重。
-const visited = reactive({ roles: false, perms: false });
+/// 配置 / 角色 / 权限三张表按需加载:一进页面就打五次远端太重。
+const visited = reactive({ configs: false, roles: false, perms: false });
 
 const fail = (e, fallback) => message.error(e?.response?.data?.error || fallback);
 
@@ -203,7 +204,203 @@ async function removeNs(r) {
   }
 }
 
-// ============ 2. 账号 ============
+// ============ 2. 配置 ============
+// 这个 Tab 除了看 / 删远端配置,还负责「同步为模板」:把整个命名空间的配置
+// 拉回 opsctl 存成配置模板,再到总览页的「初始化配置」里回放到别的集群 ——
+// dev→test 的克隆就是这两步。所以同步是这里的主操作,删除反而是次要动作。
+
+const configs = ref([]);
+const configTotal = ref(0);
+const configPage = reactive({ pageNo: 1, pageSize: 20 });
+const configNotice = ref('');
+
+/// 集群自身配置的命名空间;空串就是 Nacos 的 public。本页不做切换,
+/// 避免「列表是 A 命名空间、删除打到 B」这种最危险的错位。
+const clusterNs = computed(() => cluster.value?.namespace || '');
+
+async function loadConfigs() {
+  loading.configs = true;
+  try {
+    const r = await api.nacosConfigs(clusterId, {
+      page_no: configPage.pageNo,
+      page_size: configPage.pageSize,
+    });
+    configs.value = r.items || [];
+    configTotal.value = r.total || 0;
+    /// 读失败时后端给的是 ok:false + message(不抛 400),原样展示,别吞掉。
+    configNotice.value = r.ok === false ? r.message || '读取配置失败' : '';
+  } catch (e) {
+    fail(e, '加载配置失败');
+  } finally {
+    loading.configs = false;
+  }
+}
+
+/// 配置格式只是个标签,没有风险分级,统一 muted,免得和状态色抢注意力。
+function typePill(type) {
+  return h('span', { class: 'pill pill-muted' }, [
+    h(Icon, { name: 'file', size: 11 }),
+    h('span', type || 'text'),
+  ]);
+}
+
+const configColumns = [
+  {
+    title: 'dataId',
+    key: 'data_id',
+    render: (r) =>
+      h(
+        NButton,
+        { text: true, class: 'mono', onClick: () => openConfigView(r) },
+        { default: () => r.data_id }
+      ),
+  },
+  { title: 'group', key: 'group', width: 180, render: (r) => h('span', { class: 'mono' }, r.group) },
+  { title: '格式', key: 'type', width: 112, render: (r) => typePill(r.type) },
+  {
+    title: '操作',
+    key: 'ops',
+    width: 150,
+    render: (r) =>
+      h('div', { class: 'row-ops' }, [
+        h(NButton, { size: 'tiny', onClick: () => openConfigView(r) }, { default: () => '查看' }),
+        h(
+          NPopconfirm,
+          { onPositiveClick: () => removeConfig(r), positiveText: '删除', negativeText: '取消' },
+          {
+            trigger: () =>
+              h(NButton, { size: 'tiny', type: 'error', tertiary: true }, { default: () => '删除' }),
+            default: () =>
+              `删除的是远端 Nacos 上的配置「${r.data_id}」(group ${r.group}),不可恢复,` +
+              '请先确认没有服务还在读它。',
+          }
+        ),
+      ]),
+  },
+];
+
+// ---- 查看正文 ----
+
+const cfgView = reactive({
+  show: false,
+  loading: false,
+  data_id: '',
+  group: '',
+  namespace: '',
+  bytes: 0,
+  content: '',
+  error: '',
+});
+
+async function openConfigView(r) {
+  cfgView.show = true;
+  cfgView.loading = true;
+  cfgView.data_id = r.data_id;
+  cfgView.group = r.group;
+  cfgView.namespace = clusterNs.value;
+  cfgView.bytes = 0;
+  cfgView.content = '';
+  cfgView.error = '';
+  try {
+    /// 不传 namespace:列表就是按集群默认命名空间拉的,详情必须落在同一个 tenant。
+    const d = await api.nacosConfigDetail(clusterId, { data_id: r.data_id, group: r.group });
+    if (d.ok) {
+      cfgView.namespace = d.namespace || '';
+      cfgView.bytes = d.bytes || 0;
+      cfgView.content = d.content || '';
+    } else {
+      cfgView.error = d.message || '读取配置正文失败';
+    }
+  } catch (e) {
+    cfgView.error = e?.response?.data?.error || '读取配置正文失败';
+  } finally {
+    cfgView.loading = false;
+  }
+}
+
+/// 非 HTTPS 或用户拒权时 clipboard 直接抛错,降级成「请手动复制」而不是静默失败。
+async function copyConfig() {
+  try {
+    await navigator.clipboard.writeText(cfgView.content || '');
+    message.success('配置正文已复制');
+  } catch {
+    message.warning('浏览器不允许写剪贴板,请手动选中正文复制');
+  }
+}
+
+async function removeConfig(r) {
+  try {
+    await api.deleteNacosConfig(clusterId, { data_id: r.data_id, group: r.group });
+    message.success(`已删除配置「${r.data_id}」`);
+    /// 正在看的就是被删的那条,抽屉里的内容已经失效,直接收起来。
+    if (cfgView.show && cfgView.data_id === r.data_id && cfgView.group === r.group) {
+      cfgView.show = false;
+    }
+    await loadConfigs();
+  } catch (e) {
+    fail(e, '删除配置失败');
+  }
+}
+
+// ---- 同步为模板 ----
+
+const sync = reactive({ show: false, running: false, namespace: '', templateName: '', result: null });
+
+function openSync() {
+  sync.namespace = '';
+  sync.templateName = '';
+  sync.result = null;
+  sync.show = true;
+}
+
+const syncColumns = [
+  { title: 'dataId', key: 'data_id', render: (r) => h('span', { class: 'mono' }, r.data_id) },
+  { title: 'group', key: 'group', width: 160, render: (r) => h('span', { class: 'mono' }, r.group) },
+  { title: '格式', key: 'type', width: 112, render: (r) => typePill(r.type) },
+  {
+    title: '字节数',
+    key: 'bytes',
+    width: 150,
+    render: (r) =>
+      h('div', { class: 'row-ops' }, [
+        h('span', { class: 'num' }, r.bytes ?? 0),
+        /// 空内容多半是远端本来就没写全,回放时会覆盖出一个空配置,值得标出来。
+        r.empty
+          ? h('span', { class: 'pill pill-warn' }, [
+              h(Icon, { name: 'alert', size: 11 }),
+              h('span', '空内容'),
+            ])
+          : null,
+      ]),
+  },
+];
+
+async function runSync(dryRun) {
+  sync.running = true;
+  try {
+    const r = await api.syncNacosConfigs(clusterId, {
+      /// 后端 template_name 是字符串(不接受 null),留空即由后端自动生成名字。
+      template_name: sync.templateName.trim(),
+      namespace: sync.namespace.trim() || null,
+      dry_run: dryRun,
+    });
+    sync.result = r;
+    if (dryRun) {
+      message.info(`试运行完成:读到 ${r.total} 条配置,未落库`);
+    } else {
+      message.success(
+        `已同步 ${r.total} 条配置为模板「${r.template_name}」,` +
+          '可在 Nacos 总览页 → 初始化配置 中回放到其它集群'
+      );
+    }
+  } catch (e) {
+    fail(e, dryRun ? '试运行失败' : '同步失败');
+  } finally {
+    sync.running = false;
+  }
+}
+
+// ============ 3. 账号 ============
 
 const users = ref([]);
 const userTotal = ref(0);
@@ -315,7 +512,7 @@ async function removeUser(r) {
   }
 }
 
-// ============ 3. 角色绑定 ============
+// ============ 4. 角色绑定 ============
 
 const roles = ref([]);
 const roleTotal = ref(0);
@@ -395,7 +592,7 @@ async function unbindRole(r) {
   }
 }
 
-// ============ 4. 权限 ============
+// ============ 5. 权限 ============
 
 const perms = ref([]);
 const permTotal = ref(0);
@@ -556,9 +753,13 @@ async function revokePerm(r) {
   }
 }
 
-// ---- 标签页:角色 / 权限首次进入才拉数据 ----
+// ---- 标签页:配置 / 角色 / 权限首次进入才拉数据 ----
 
 function onTab(v) {
+  if (v === 'configs' && !visited.configs) {
+    visited.configs = true;
+    loadConfigs();
+  }
   if (v === 'roles' && !visited.roles) {
     visited.roles = true;
     loadRoles();
@@ -589,7 +790,7 @@ onMounted(() => {
         <h2>{{ cluster?.name || 'Nacos 集群' }}</h2>
         <span v-if="cluster?.env" class="pill" :class="`env-${cluster.env}`">{{ cluster.env }}</span>
         <span v-if="cluster?.status === 'disabled'" class="pill pill-muted">已停用</span>
-        <span class="sub">命名空间 · 账号 · 角色 · 权限</span>
+        <span class="sub">命名空间 · 配置 · 账号 · 角色 · 权限</span>
       </div>
       <ul v-if="cluster?.endpoints?.length" class="eps">
         <li v-for="ep in cluster.endpoints" :key="ep" class="mono ellip" :title="ep">{{ ep }}</li>
@@ -643,6 +844,55 @@ onMounted(() => {
             :scroll-x="900"
             size="small"
           />
+        </n-card>
+      </n-tab-pane>
+
+      <!-- ============ 配置 ============ -->
+      <n-tab-pane name="configs" tab="配置">
+        <n-card size="small" :bordered="false">
+          <template #header>
+            <span class="card-title">配置</span>
+            <span class="card-sub">
+              命名空间 <b class="mono">{{ clusterNs || 'public' }}</b> · 集群默认,本页不切换
+            </span>
+          </template>
+          <template #header-extra>
+            <div class="row-ops">
+              <n-button size="small" :loading="loading.configs" @click="loadConfigs">
+                <Icon name="refresh" :size="15" style="margin-right:6px" /> 刷新
+              </n-button>
+              <n-button size="small" type="primary" @click="openSync">
+                <Icon name="database" :size="15" style="margin-right:6px" /> 同步为模板
+              </n-button>
+            </div>
+          </template>
+
+          <p v-if="configNotice" class="help">{{ configNotice }}</p>
+
+          <div v-if="!configs.length && !loading.configs" class="empty-page sm">
+            <Icon name="file" :size="26" />
+            <h3>该命名空间还没有配置</h3>
+            <p>可以到 Nacos 总览页用「初始化配置」把模板下发到这个集群,再回来查看。</p>
+            <n-button size="small" @click="router.push('/nacos')">去总览页</n-button>
+          </div>
+          <template v-else>
+            <n-data-table
+              :columns="configColumns"
+              :data="configs"
+              :loading="loading.configs"
+              :bordered="false"
+              :scroll-x="760"
+              size="small"
+            />
+            <div class="pager">
+              <n-pagination
+                v-model:page="configPage.pageNo"
+                :page-size="configPage.pageSize"
+                :item-count="configTotal"
+                @update:page="loadConfigs"
+              />
+            </div>
+          </template>
         </n-card>
       </n-tab-pane>
 
@@ -999,6 +1249,94 @@ onMounted(() => {
         </div>
       </template>
     </n-modal>
+
+    <!-- ============ 配置正文 ============ -->
+    <n-drawer v-model:show="cfgView.show" :width="720" placement="right">
+      <n-drawer-content :title="cfgView.data_id || '配置正文'" closable>
+        <div class="cfg-meta">
+          <span>group <b class="mono">{{ cfgView.group }}</b></span>
+          <span>命名空间 <b class="mono">{{ cfgView.namespace || 'public' }}</b></span>
+          <span>字节数 <b class="num">{{ cfgView.bytes }}</b></span>
+          <span class="sp" />
+          <n-button size="tiny" :disabled="!cfgView.content" @click="copyConfig">
+            <Icon name="file" :size="14" style="margin-right:6px" /> 复制
+          </n-button>
+        </div>
+
+        <n-alert v-if="cfgView.error" type="error" :bordered="false">{{ cfgView.error }}</n-alert>
+        <n-spin v-else :show="cfgView.loading">
+          <p v-if="!cfgView.loading && !cfgView.content" class="help">这条配置在远端的正文是空的。</p>
+          <pre v-else class="mono cfg-body">{{ cfgView.content }}</pre>
+        </n-spin>
+      </n-drawer-content>
+    </n-drawer>
+
+    <!-- ============ 同步为模板 ============ -->
+    <!-- 用抽屉而不是模态:结果明细是一张表,步骤式披露也需要更宽的版面。 -->
+    <n-drawer v-model:show="sync.show" :width="760" placement="right">
+      <n-drawer-content :title="`同步为模板 · ${cluster?.name || ''}`" closable>
+        <div class="notice">
+          <Icon name="alert" :size="15" />
+          <span>同步只读远端 Nacos、只写 opsctl 自己的模板库,不会改动集群上的任何配置。</span>
+        </div>
+
+        <section class="step">
+          <h4><span class="idx">1</span> 同步范围</h4>
+          <div class="f-grid">
+            <n-form-item label="命名空间" label-placement="top" :show-feedback="false">
+              <n-input
+                v-model:value="sync.namespace"
+                size="small"
+                class="mono"
+                :placeholder="clusterNs || 'public(集群默认)'"
+              />
+            </n-form-item>
+            <n-form-item label="模板名称" label-placement="top" :show-feedback="false">
+              <n-input v-model:value="sync.templateName" size="small" placeholder="留空自动生成" />
+            </n-form-item>
+          </div>
+          <p class="help">先「试运行」看清会同步哪些配置,确认无误再「同步」落库。</p>
+        </section>
+
+        <!-- 结果区:跑过才出现(渐进式披露),试运行明确标「未落库」 -->
+        <section v-if="sync.result" class="step">
+          <h4>
+            <span class="idx">2</span>
+            {{ sync.result.dry_run ? '试运行结果' : '同步结果' }}
+          </h4>
+          <div class="res-sum">
+            <Icon :name="sync.result.dry_run ? 'eye' : 'check'" :size="15" />
+            <span>
+              共 <b class="num">{{ sync.result.total }}</b> 条 · 命名空间
+              <b class="mono">{{ sync.result.namespace || 'public' }}</b>
+            </span>
+            <span v-if="sync.result.dry_run" class="pill pill-muted">未落库</span>
+            <span v-else class="pill pill-ok">模板 {{ sync.result.template_name }}</span>
+          </div>
+          <n-data-table
+            :columns="syncColumns"
+            :data="sync.result.items || []"
+            :bordered="false"
+            :scroll-x="640"
+            size="small"
+            style="margin-top:10px"
+          />
+        </section>
+
+        <template #footer>
+          <div class="modal-ft">
+            <span class="help">同步后到 Nacos 总览页 →「初始化配置」即可回放到其它集群。</span>
+            <span class="sp" />
+            <n-button size="small" :loading="sync.running" @click="runSync(true)">
+              <Icon name="eye" :size="15" style="margin-right:6px" /> 试运行
+            </n-button>
+            <n-button size="small" type="primary" :loading="sync.running" @click="runSync(false)">
+              <Icon name="play" :size="14" style="margin-right:6px" /> 同步
+            </n-button>
+          </div>
+        </template>
+      </n-drawer-content>
+    </n-drawer>
   </div>
 </template>
 
@@ -1069,6 +1407,26 @@ onMounted(() => {
 .res-preview .lbl { color: var(--muted); }
 .res-preview b { color: var(--accent); font-weight: 600; }
 
+/* ---- 配置抽屉 ---- */
+.cfg-meta { display: flex; align-items: center; gap: 14px; margin: 0 0 12px;
+  font-size: 12.5px; color: var(--muted); }
+.cfg-meta b { color: var(--fg-2); font-weight: 600; }
+.cfg-body { margin: 0; padding: 12px 14px; border-radius: 8px; background: var(--bg);
+  border: 1px solid rgba(255,255,255,.06); font-size: 12.5px; line-height: 1.65; color: var(--fg-2);
+  white-space: pre-wrap; word-break: break-all; max-height: 62vh; overflow: auto; }
+
+/* ---- 同步抽屉:沿用总览页「初始化配置」的步骤条观感 ---- */
+.step { padding: 0 0 18px; }
+.step h4 { display: flex; align-items: center; gap: 8px; margin: 0 0 10px;
+  font-size: 13px; color: var(--fg); font-weight: 620; }
+.step .idx { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 6px;
+  background: color-mix(in oklab, var(--accent), transparent 82%); color: var(--accent);
+  font-size: 11px; font-weight: 700; }
+.res-sum { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-radius: 8px;
+  background: var(--bg); font-size: 12.5px; color: var(--fg-2);
+  transition: background .18s ease; }
+.res-sum > :deep(.ic) { color: var(--accent); }
+
 /* ---- 排版细节 ---- */
 .mono, :deep(.mono) { font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Consolas, monospace; }
 .num, :deep(.num) { font-variant-numeric: tabular-nums; }
@@ -1089,6 +1447,6 @@ onMounted(() => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .res-preview { transition: none; }
+  .res-preview, .res-sum { transition: none; }
 }
 </style>

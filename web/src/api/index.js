@@ -135,6 +135,10 @@ export const api = {
   nacosPermissions: (id, params) => http.get(`/nacos/clusters/${id}/permissions`, { params }).then((r) => r.data),
   grantNacosPermission: (id, body) => http.post(`/nacos/clusters/${id}/permissions`, body).then((r) => r.data),
   revokeNacosPermission: (id, params) => http.delete(`/nacos/clusters/${id}/permissions`, { params }).then((r) => r.data),
+  // ---- Nacos 配置:读正文 / 删除 / 整库同步为模板 ----
+  nacosConfigDetail: (id, params) => http.get(`/nacos/clusters/${id}/configs/detail`, { params }).then((r) => r.data),
+  deleteNacosConfig: (id, params) => http.delete(`/nacos/clusters/${id}/configs`, { params }).then((r) => r.data),
+  syncNacosConfigs: (id, body) => http.post(`/nacos/clusters/${id}/sync`, body).then((r) => r.data),
 };
 
 export default http;
