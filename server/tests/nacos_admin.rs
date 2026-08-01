@@ -801,3 +801,286 @@ async fn one_step_grant_creates_role_and_reports_user_access() {
         .await;
     assert_eq!(s, 403);
 }
+
+#[tokio::test]
+async fn grant_writes_nacos_shaped_resources_and_batches() {
+    // 资源串写错第三段,Nacos 的授权判定(把 * 换成 .* 后整串正则匹配)永远匹配不上,
+    // 权限看着有、其实是空的。这里逐个形状核对,并验证一次授多个命名空间。
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let n = mock().await;
+    let id = cluster(&app, &admin, &n.addr).await;
+    let (s, _) = app
+        .post(
+            &format!("/nacos/clusters/{id}/users"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "password": "p" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+
+    // 限定分组 + 类型 + 名称
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "namespace_id": "dev-ns", "action": "r",
+                    "group": "DEFAULT_GROUP", "kind": "config", "name": "app.yaml" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["resource"], "dev-ns:DEFAULT_GROUP:config/app.yaml");
+
+    // 类型为「全部」时第三段整体是 *,而不是 */*
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "namespace_id": "dev-ns", "action": "rw",
+                    "group": "G1", "kind": "*", "name": "ignored" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["resource"], "dev-ns:G1:*");
+
+    // 类型写错必须本地拦下(服务端照单全收,但永远匹配不上)
+    let (s, e) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "namespace_id": "x", "action": "r", "kind": "configs" }),
+        )
+        .await;
+    assert_eq!(s, 400);
+    assert!(e["error"].as_str().unwrap().contains("config"), "{e}");
+
+    // 批量:一次授三个命名空间,角色只建一次
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant/batch"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "namespaces": ["a-ns", "b-ns", ""], "action": "rw" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["ok_count"], 3);
+    assert_eq!(v["created_role"], false, "第一条授权时已经建过角色了");
+    let res: Vec<&str> =
+        v["items"].as_array().unwrap().iter().map(|i| i["resource"].as_str().unwrap()).collect();
+    assert_eq!(res, vec!["a-ns:*:*", "b-ns:*:*", ":*:*"], "public 首段应为空");
+    assert_eq!(n.state.lock().unwrap().roles.iter().filter(|(r, _)| r == "dev1-role").count(), 1);
+
+    // 回读:资源串原样呈现,收回时按整串匹配
+    let (_, acc) = app.get(&format!("/nacos/clusters/{id}/users/dev1/access"), &admin, "admin-dev").await;
+    let grants = acc["grants"].as_array().unwrap();
+    assert_eq!(grants.len(), 5);
+    assert!(grants.iter().any(|g| g["resource"] == "dev-ns:DEFAULT_GROUP:config/app.yaml"));
+    let (s, _) = app
+        .delete(
+            &format!(
+                "/nacos/clusters/{id}/grant?username=dev1&action=r&resource=dev-ns:DEFAULT_GROUP:config/app.yaml"
+            ),
+            &admin,
+            "admin-dev",
+        )
+        .await;
+    assert_eq!(s, 200);
+    let (_, acc) = app.get(&format!("/nacos/clusters/{id}/users/dev1/access"), &admin, "admin-dev").await;
+    assert_eq!(acc["grants"].as_array().unwrap().len(), 4);
+
+    // 批量必须给命名空间
+    let (s, e) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant/batch"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "namespaces": [], "action": "r" }),
+        )
+        .await;
+    assert_eq!(s, 400);
+    assert!(e["error"].as_str().unwrap().contains("命名空间"), "{e}");
+}
+
+#[tokio::test]
+async fn account_template_stamps_out_users_with_grants() {
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let n = mock().await;
+    let id = cluster(&app, &admin, &n.addr).await;
+
+    let (s, t) = app
+        .post(
+            "/nacos/account-templates",
+            &admin,
+            "admin-dev",
+            json!({ "name": "研发标准账号", "note": "新集群开号用",
+                    "items": [
+                        { "username": "dev-a", "password": "Dev@2026", "action": "rw",
+                          "namespaces": ["dev-ns", ""] },
+                        { "username": "readonly", "password": "Ro@2026", "action": "r",
+                          "namespaces": ["dev-ns"] },
+                        { "username": "nobody", "password": "N@2026" }
+                    ] }),
+        )
+        .await;
+    assert_eq!(s, 200, "{t}");
+    let tpl = t["id"].as_str().unwrap().to_string();
+
+    let (s, list) = app.get("/nacos/account-templates", &admin, "admin-dev").await;
+    assert_eq!(s, 200);
+    assert_eq!(list[0]["name"], "研发标准账号");
+    let items: Vec<Value> = serde_json::from_str(list[0]["items"].as_str().unwrap()).unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["password"], "Dev@2026");
+
+    // 试运行:不建号、不授权
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/accounts/apply"),
+            &admin,
+            "admin-dev",
+            json!({ "template_id": tpl, "dry_run": true }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["items"][0]["status"], "would_create");
+    assert_eq!(v["items"][0]["grants"][0]["status"], "would_grant");
+    assert_eq!(n.state.lock().unwrap().users.len(), 1, "试运行不该建号");
+
+    // 真执行
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/accounts/apply"),
+            &admin,
+            "admin-dev",
+            json!({ "template_id": tpl }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["ok_count"], 3);
+    assert_eq!(v["items"][0]["status"], "created");
+    let g: Vec<&str> =
+        v["items"][0]["grants"].as_array().unwrap().iter().map(|x| x["resource"].as_str().unwrap()).collect();
+    assert_eq!(g, vec!["dev-ns:*:*", ":*:*"]);
+    // action 留空的那条只建号,不授权
+    assert_eq!(v["items"][2]["status"], "created");
+    assert!(v["items"][2]["grants"].as_array().unwrap().is_empty());
+
+    let st = n.state.lock().unwrap();
+    assert!(st.users.contains(&"dev-a".to_string()));
+    assert!(st.users.contains(&"readonly".to_string()));
+    assert!(st.perms.iter().any(|(r, res, a)| r == "dev-a-role" && res == "dev-ns:*:*" && a == "rw"));
+    drop(st);
+
+    // 重复执行:已存在的账号跳过且**不重置口令**
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/accounts/apply"),
+            &admin,
+            "admin-dev",
+            json!({ "template_id": tpl }),
+        )
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["items"][0]["status"], "exists");
+    assert_eq!(v["status"], "ok");
+
+    // 审计
+    let (_, rows) = app.get("/audit?action=nacos_accounts_apply", &admin, "admin-dev").await;
+    assert_eq!(rows.as_array().unwrap().len(), 2, "试运行不记审计");
+
+    // 删除模板
+    let (s, _) = app.delete(&format!("/nacos/account-templates/{tpl}"), &admin, "admin-dev").await;
+    assert_eq!(s, 200);
+    let (_, list) = app.get("/nacos/account-templates", &admin, "admin-dev").await;
+    assert!(list.as_array().unwrap().is_empty());
+
+    // operator 不得使用
+    let op = app.operator().await;
+    let (s, _) = app.get("/nacos/account-templates", &op, "op-dev").await;
+    assert_eq!(s, 403);
+}
+
+#[tokio::test]
+async fn repeated_grants_are_idempotent() {
+    // Nacos 的 permissions 表对 (role, resource, action) 有唯一约束,重复插入会报错;
+    // 而「批量 / 账号模板」的用法就是要能反复执行。已有的必须跳过,而不是变成一堆失败。
+    let app = spawn().await;
+    let admin = app.admin().await;
+    let n = mock().await;
+    let id = cluster(&app, &admin, &n.addr).await;
+    let (s, _) = app
+        .post(
+            &format!("/nacos/clusters/{id}/users"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "password": "p" }),
+        )
+        .await;
+    assert_eq!(s, 200);
+
+    let body = json!({ "username": "dev1", "namespaces": ["a-ns", "b-ns"], "action": "rw" });
+    let (s, v) = app
+        .post(&format!("/nacos/clusters/{id}/grant/batch"), &admin, "admin-dev", body.clone())
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["ok_count"], 2);
+    assert!(v["items"].as_array().unwrap().iter().all(|i| i["status"] == "ok"));
+
+    // 再来一次:全部报「已存在」,远端不新增行
+    let before = n.state.lock().unwrap().perms.len();
+    let (s, v) = app
+        .post(&format!("/nacos/clusters/{id}/grant/batch"), &admin, "admin-dev", body)
+        .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["status"], "ok", "重跑不该算失败:{v}");
+    assert!(v["items"].as_array().unwrap().iter().all(|i| i["status"] == "exists"), "{v}");
+    assert_eq!(n.state.lock().unwrap().perms.len(), before, "不该产生重复行");
+
+    // 单条授权同理
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/grant"),
+            &admin,
+            "admin-dev",
+            json!({ "username": "dev1", "namespace_id": "a-ns", "action": "rw" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(n.state.lock().unwrap().perms.len(), before);
+
+    // 账号模板重跑同理
+    let (s, t) = app
+        .post(
+            "/nacos/account-templates",
+            &admin,
+            "admin-dev",
+            json!({ "name": "幂等验证",
+                    "items": [{ "username": "dev1", "password": "x", "action": "rw",
+                                "namespaces": ["a-ns"] }] }),
+        )
+        .await;
+    assert_eq!(s, 200, "{t}");
+    let (s, v) = app
+        .post(
+            &format!("/nacos/clusters/{id}/accounts/apply"),
+            &admin,
+            "admin-dev",
+            json!({ "template_id": t["id"].as_str().unwrap() }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["items"][0]["status"], "exists");
+    assert_eq!(v["items"][0]["grants"][0]["status"], "exists");
+    assert_eq!(n.state.lock().unwrap().perms.len(), before);
+}

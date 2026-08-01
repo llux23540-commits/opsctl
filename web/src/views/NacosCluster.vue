@@ -590,6 +590,7 @@ const accessColumns = [
   {
     title: '命名空间',
     key: 'namespace_id',
+    width: 200,
     render: (r) => {
       const id = r.namespace_id || '';
       const name = nsNameById.value.get(id);
@@ -599,12 +600,19 @@ const accessColumns = [
       ]);
     },
   },
+  {
+    /// 命名空间只是资源串的第一段。授权可能只落在某个 group / 某种类型 / 某条配置上,
+    /// 不把原串摆出来,用户就分不清「整个空间」和「空间里的一条配置」。
+    title: '资源',
+    key: 'resource',
+    render: (r) => h('span', { class: 'mono' }, r.resource || '—'),
+  },
   { title: '动作', key: 'action', width: 120, render: (r) => actionPill(r.action) },
   {
     /// 角色是 Nacos 的实现细节,留一列交代权限从哪来,但压成小字不抢视线。
     title: '来源角色',
     key: 'role',
-    width: 220,
+    width: 200,
     render: (r) => h('span', { class: 'mono row-note' }, r.role),
   },
   {
@@ -619,7 +627,7 @@ const accessColumns = [
           trigger: () =>
             h(NButton, { size: 'tiny', type: 'error', tertiary: true }, { default: () => '收回' }),
           default: () =>
-            `收回「${selected.value}」对命名空间 ${r.namespace_id || 'public'} 的 ${r.action} 权限?` +
+            `收回「${selected.value}」对资源 ${r.resource} 的 ${r.action} 权限?` +
             `该权限挂在角色「${r.role}」上,同角色的其他账号会一起失去它。`,
         }
       ),
@@ -628,10 +636,11 @@ const accessColumns = [
 
 async function revokeGrant(r) {
   try {
+    /// resource 原样回传:Nacos 按资源串逐字匹配,少一段多一段都删不掉这一行。
     await api.revokeNacosUser(clusterId, {
       username: selected.value,
-      namespace_id: r.namespace_id || '',
       action: r.action,
+      resource: r.resource,
     });
     message.success('权限已收回');
     await loadAccess();
@@ -640,7 +649,7 @@ async function revokeGrant(r) {
   }
 }
 
-// ---- 授权:只有命名空间 + 动作两个选择 ----
+// ---- 授权:命名空间(可多选)+ 动作,资源范围收在「高级」里 ----
 
 const ACTION_OPTS = [
   { label: 'r 只读', value: 'r' },
@@ -648,35 +657,153 @@ const ACTION_OPTS = [
   { label: 'rw 读写', value: 'rw' },
 ];
 
+/// Nacos 只认这三种类型;「全部」用 * 表示,且会让资源串第三段整体塌缩(见 buildResource)。
+const KIND_OPTS = [
+  { label: '全部(配置 + 服务)', value: '*' },
+  { label: '配置 config', value: 'config' },
+  { label: '服务 naming', value: 'naming' },
+];
+
 /// public 的 id 是空串,原样传给 Nacos(资源串第一段留空)。
 const nsOpts = computed(() =>
   namespaces.value.map((n) => ({ label: nsLabel(n.namespace_id || ''), value: n.namespace_id || '' }))
 );
 
-const grantForm = reactive({ show: false, saving: false, namespace_id: '', action: 'r' });
+const grantForm = reactive({
+  show: false,
+  saving: false,
+  namespaces: [],
+  action: 'r',
+  /// 高级项默认折叠:九成场景就是「整个命名空间」,把 group/类型/名称摆在明面上
+  /// 只会让人以为必须填。
+  advanced: false,
+  group: '',
+  kind: '*',
+  name: '',
+  result: null,
+});
+
+/// Nacos 的资源串 = <namespaceId>:<group>:<type>/<name>,分隔符 ':',通配 '*'。
+/// 三条一写错就「授了等于没授」的规则,预览和实际下发必须共用同一套:
+///   1) public 的 namespaceId 是空串,所以它的整空间授权写出来就是 ':*:*';
+///   2) 类型选「全部」时,第三段整体塌缩成 '*' —— 写成 '*/*' 在 Nacos 侧永远匹配不上;
+///   3) group / 名称留空一律按 '*'。
+function buildResource(nsId) {
+  const group = grantForm.group.trim() || '*';
+  const kind = grantForm.kind || '*';
+  const tail = kind === '*' ? '*' : `${kind}/${grantForm.name.trim() || '*'}`;
+  return `${nsId || ''}:${group}:${tail}`;
+}
+
+/// 实时预览:选几个命名空间就几行,所见即所写。
+const grantPreview = computed(() =>
+  grantForm.namespaces.map((id) => ({ id, label: nsLabel(id), resource: buildResource(id) }))
+);
+
+/// 折叠高级项时把它们复位:留着看不见的 group/名称继续生效,预览之外再无线索,太容易误伤。
+function toggleAdvanced() {
+  grantForm.advanced = !grantForm.advanced;
+  if (!grantForm.advanced) {
+    grantForm.group = '';
+    grantForm.kind = '*';
+    grantForm.name = '';
+  }
+}
+
+function pickAllNs() {
+  grantForm.namespaces = namespaces.value.map((n) => n.namespace_id || '');
+}
+
+function clearNs() {
+  grantForm.namespaces = [];
+}
 
 function openGrant() {
-  grantForm.namespace_id = namespaces.value[0]?.namespace_id ?? '';
+  /// 默认就是左侧正在看的那个空间;没有就退回第一个,免得开局是空表单。
+  const def = namespaces.value.some((n) => (n.namespace_id || '') === selectedNs.value)
+    ? selectedNs.value
+    : namespaces.value[0]?.namespace_id ?? '';
+  grantForm.namespaces = namespaces.value.length ? [def] : [];
   grantForm.action = 'r';
+  grantForm.advanced = false;
+  grantForm.group = '';
+  grantForm.kind = '*';
+  grantForm.name = '';
+  grantForm.result = null;
   grantForm.show = true;
+}
+
+const grantResultColumns = [
+  {
+    title: '命名空间',
+    key: 'namespace_id',
+    width: 180,
+    render: (r) => h('span', { class: 'mono' }, r.namespace_id || 'public'),
+  },
+  { title: '资源', key: 'resource', render: (r) => h('span', { class: 'mono' }, r.resource || '—') },
+  {
+    title: '结果',
+    key: 'status',
+    width: 200,
+    render: (r) => {
+      const ok = r.status === 'ok';
+      return h('div', { class: 'row-ops' }, [
+        h('span', { class: `pill pill-${ok ? 'ok' : 'danger'}` }, [
+          h(Icon, { name: ok ? 'check' : 'close', size: 11 }),
+          h('span', ok ? '已授权' : '失败'),
+        ]),
+        r.message ? h('span', { class: 'row-note' }, r.message) : null,
+      ]);
+    },
+  },
+];
+
+function grantDone(r) {
+  message.success(
+    r.created_role
+      ? `已授权;该账号原本没有角色,已自动创建并绑定角色「${r.role}」`
+      : `已授权,经由角色「${r.role}」生效`
+  );
+  grantForm.show = false;
 }
 
 async function saveGrant() {
   const username = selected.value;
   if (!username) return;
+  if (!grantForm.namespaces.length) {
+    message.warning('至少选一个命名空间');
+    return;
+  }
+  const kind = grantForm.kind || '*';
+  const scope = {
+    action: grantForm.action,
+    group: grantForm.group.trim() || '*',
+    kind,
+    /// 类型为「全部」时第三段没有名称的落点,统一按 '*' 传,和预览保持逐字一致。
+    name: kind === '*' ? '*' : grantForm.name.trim() || '*',
+  };
   grantForm.saving = true;
   try {
-    const r = await api.grantNacosUser(clusterId, {
-      username,
-      namespace_id: grantForm.namespace_id || '',
-      action: grantForm.action,
-    });
-    message.success(
-      r.created_role
-        ? `已授权;该账号原本没有角色,已自动创建并绑定角色「${r.role}」`
-        : `已授权,经由角色「${r.role}」生效`
-    );
-    grantForm.show = false;
+    if (grantForm.namespaces.length === 1) {
+      const r = await api.grantNacosUser(clusterId, {
+        username,
+        namespace_id: grantForm.namespaces[0] || '',
+        ...scope,
+      });
+      grantForm.result = null;
+      grantDone(r);
+    } else {
+      const r = await api.grantNacosUserBatch(clusterId, {
+        username,
+        namespaces: grantForm.namespaces,
+        ...scope,
+      });
+      grantForm.result = r;
+      /// 部分成功时留在弹窗里:哪个空间没授上、为什么,只有这张表说得清,
+      /// 关掉就等于把失败咽了。
+      if (r.ok_count === r.total) grantDone(r);
+      else message.warning(`部分成功:${r.ok_count}/${r.total} 个命名空间已授权`);
+    }
     await loadAccess();
   } catch (e) {
     fail(e, '授权失败');
@@ -944,7 +1071,7 @@ onMounted(async () => {
                 :data="access.grants"
                 :loading="loading.access"
                 :bordered="false"
-                :scroll-x="700"
+                :scroll-x="900"
                 size="small"
               />
             </section>
@@ -1061,19 +1188,106 @@ onMounted(async () => {
       </template>
     </n-modal>
 
-    <!-- ============ 授权:账号 → 命名空间 ============ -->
-    <n-modal v-model:show="grantForm.show" preset="card" title="授权" style="width:520px;max-width:94vw">
+    <!-- ============ 授权:账号 → 命名空间(可多选)============ -->
+    <!-- 常规路径只有「选空间 + 选动作」两步;资源范围是少数场景,折起来不占视线 -->
+    <n-modal v-model:show="grantForm.show" preset="card" title="授权" style="width:600px;max-width:94vw">
       <n-form label-placement="top" :show-feedback="false">
         <n-form-item label="账号">
           <n-input :value="selected" class="mono" disabled />
         </n-form-item>
-        <n-form-item label="命名空间">
-          <n-select v-model:value="grantForm.namespace_id" :options="nsOpts" filterable />
+        <n-form-item>
+          <template #label>
+            <span class="lbl-row">
+              命名空间
+              <span class="sp" />
+              <n-button text size="tiny" :disabled="!namespaces.length" @click="pickAllNs">全选</n-button>
+              <n-button text size="tiny" :disabled="!grantForm.namespaces.length" @click="clearNs">清空</n-button>
+            </span>
+          </template>
+          <n-select
+            v-model:value="grantForm.namespaces"
+            :options="nsOpts"
+            multiple
+            filterable
+            placeholder="可多选,一次授给多个命名空间"
+          />
         </n-form-item>
         <n-form-item label="动作">
           <n-select v-model:value="grantForm.action" :options="ACTION_OPTS" />
         </n-form-item>
       </n-form>
+
+      <n-button text size="small" class="adv-tg" @click="toggleAdvanced">
+        <Icon :name="grantForm.advanced ? 'minus' : 'plus'" :size="14" style="margin-right:6px" />
+        限定资源范围
+        <span class="row-note" style="margin-left:8px">不展开就是整个命名空间</span>
+      </n-button>
+
+      <transition name="adv">
+        <n-form v-if="grantForm.advanced" label-placement="top" :show-feedback="false" class="adv-box">
+          <n-form-item label="类型">
+            <n-select v-model:value="grantForm.kind" :options="KIND_OPTS" />
+          </n-form-item>
+          <div class="adv-row">
+            <n-form-item label="group">
+              <n-input v-model:value="grantForm.group" class="mono" placeholder="*" />
+            </n-form-item>
+            <n-form-item label="名称">
+              <!-- 类型为「全部」时资源串第三段整体塌缩成 *,名称没有落点,禁掉免得白填 -->
+              <n-input
+                v-model:value="grantForm.name"
+                class="mono"
+                placeholder="*"
+                :disabled="grantForm.kind === '*'"
+              />
+            </n-form-item>
+          </div>
+          <p class="help">
+            类型为「全部」时名称不可用:资源串第三段会整体写成 <b class="mono">*</b>。
+            group 与名称留空都按 <b class="mono">*</b> 处理。
+          </p>
+        </n-form>
+      </transition>
+
+      <!-- 资源串是 Nacos 侧唯一生效的东西,先摆出来再让人点授权 -->
+      <div class="prev-hd">
+        将写入 <b class="num">{{ grantPreview.length }}</b> 条资源
+      </div>
+      <ul v-if="grantPreview.length" class="prev">
+        <li v-for="p in grantPreview" :key="p.id">
+          <span class="mono">{{ p.resource }}</span>
+          <span class="row-note">{{ p.label }}</span>
+        </li>
+      </ul>
+      <p v-else class="help">还没选命名空间。</p>
+
+      <!-- 批量结果:哪个空间成了、哪个没成,逐行交代 -->
+      <section v-if="grantForm.result" class="gr-res">
+        <div class="res-sum" :class="{ warn: grantForm.result.ok_count !== grantForm.result.total }">
+          <Icon
+            :name="grantForm.result.ok_count === grantForm.result.total ? 'check' : 'alert'"
+            :size="15"
+          />
+          <span>
+            <b class="num">{{ grantForm.result.ok_count }}</b> /
+            <b class="num">{{ grantForm.result.total }}</b> 个命名空间已授权
+            <template v-if="grantForm.result.role">
+              · 角色 <b class="mono">{{ grantForm.result.role }}</b>
+            </template>
+          </span>
+          <span v-if="grantForm.result.ok_count !== grantForm.result.total" class="pill pill-warn">
+            部分成功
+          </span>
+        </div>
+        <n-data-table
+          :columns="grantResultColumns"
+          :data="grantForm.result.items || []"
+          :bordered="false"
+          :scroll-x="620"
+          size="small"
+          style="margin-top:10px"
+        />
+      </section>
 
       <p class="help gr-note">
         Nacos 的模型是 账号 → 角色 → 权限;该账号没有角色时会自动创建并绑定一个。
@@ -1083,8 +1297,16 @@ onMounted(async () => {
       <template #footer>
         <div class="modal-ft">
           <span class="sp" />
-          <n-button size="small" @click="grantForm.show = false">取消</n-button>
-          <n-button size="small" type="primary" :loading="grantForm.saving" @click="saveGrant">授权</n-button>
+          <n-button size="small" @click="grantForm.show = false">关闭</n-button>
+          <n-button
+            size="small"
+            type="primary"
+            :loading="grantForm.saving"
+            :disabled="!grantPreview.length"
+            @click="saveGrant"
+          >
+            授权
+          </n-button>
         </div>
       </template>
     </n-modal>
@@ -1313,6 +1535,32 @@ onMounted(async () => {
 .gr-note { margin-top: 14px; line-height: 1.7; }
 .gr-note b { color: var(--fg-2); }
 
+/* ---- 授权弹窗:多选空间 + 折叠的资源范围 + 资源预览 ---- */
+.lbl-row { display: flex; align-items: center; gap: 10px; width: 100%; }
+.adv-tg { margin-top: 14px; }
+.adv-box { margin-top: 10px; padding: 12px 14px; border-radius: 8px;
+  background: var(--surface-warm); border: 1px solid rgba(255,255,255,.06); }
+.adv-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
+/* 展开是「更多细节」而不是「换了个界面」:短距离下滑 + 淡入,别抢注意力 */
+.adv-enter-active, .adv-leave-active { transition: opacity .18s ease, transform .18s ease; }
+.adv-enter-from, .adv-leave-to { opacity: 0; transform: translateY(-4px); }
+
+.prev-hd { margin-top: 14px; font-size: 12px; color: var(--muted); }
+.prev-hd b { color: var(--fg-2); }
+/* 资源串是 Nacos 侧唯一生效的东西,给它一块和正文分开的底,一眼看得出「这就是要写的」 */
+.prev { margin: 6px 0 0; padding: 10px 12px; border-radius: 8px; background: var(--bg);
+  border: 1px solid rgba(255,255,255,.06); list-style: none;
+  display: flex; flex-direction: column; gap: 4px; max-height: 168px; overflow: auto; }
+.prev li { display: flex; align-items: baseline; gap: 10px; min-width: 0;
+  font-size: 12.5px; color: var(--fg-2); }
+.prev li .mono { word-break: break-all; }
+.prev li .row-note { margin-left: auto; flex: none; }
+
+.gr-res { margin-top: 14px; }
+.res-sum.warn { color: var(--warn);
+  background: color-mix(in oklab, var(--warn), transparent 90%); }
+.res-sum.warn > :deep(.ic) { color: var(--warn); }
+
 /* ---- 配置抽屉 ---- */
 .cfg-meta { display: flex; align-items: center; gap: 14px; margin: 0 0 12px;
   font-size: 12.5px; color: var(--muted); }
@@ -1356,6 +1604,7 @@ onMounted(async () => {
 
 @media (prefers-reduced-motion: reduce) {
   .res-sum, .acc-list li, .acc-list .acts,
+  .adv-enter-active, .adv-leave-active,
   .ns-side li, .ns-side li::before, .ns-side .ns-acts { transition: none; }
 }
 </style>

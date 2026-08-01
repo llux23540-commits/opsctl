@@ -18,7 +18,7 @@ const tab = ref('clusters');
 const clusters = ref([]);
 const templates = ref([]);
 const runs = ref([]);
-const loading = reactive({ clusters: false, templates: false, runs: false });
+const loading = reactive({ clusters: false, templates: false, runs: false, acctTpls: false });
 
 /// cluster id → { loading, ok, source, latency_ms, message, nodes[] }
 const health = reactive({});
@@ -613,8 +613,274 @@ const runColumns = [
   },
 ];
 
+// ---- 账号模板 ----
+// 把「谁 + 默认口令 + 要授哪些命名空间」沉淀成模板,新集群一键开号。
+// 这里刻意不暴露 group / kind / name:模板场景九成是「整个命名空间」,
+// 不传后端就按整空间授(<ns>:*:*);要精确到分组或单条配置,去集群管理页单独授。
+
+const acctTpls = ref([]);
+
+async function loadAcctTpls() {
+  loading.acctTpls = true;
+  try {
+    acctTpls.value = await api.nacosAccountTemplates();
+  } catch (e) {
+    /* 与集群同权限(admin),错误已在集群加载处提示 */
+  } finally {
+    loading.acctTpls = false;
+  }
+}
+
+const ACCT_ACTION_OPTS = [
+  { label: '不授权', value: '' },
+  { label: '只读 r', value: 'r' },
+  { label: '只写 w', value: 'w' },
+  { label: '读写 rw', value: 'rw' },
+];
+
+const acctForm = reactive({ show: false, saving: false, id: null, name: '', note: '', items: [] });
+
+function blankAcctItem() {
+  return { username: '', password: '', action: 'r', nsText: '', pub: false };
+}
+
+/// 存的 namespaces 是字符串数组,空串 = public。表单里拆成「逗号分隔的 id 文本 + 一个 public 勾选」:
+/// 空串在文本框里根本看不见,让人用逗号占位来表达 public 是没人猜得到的写法。
+function toAcctFormItem(it) {
+  const ns = Array.isArray(it.namespaces) ? it.namespaces : [];
+  return {
+    username: it.username || '',
+    password: it.password || '',
+    action: it.action == null ? 'r' : it.action,
+    nsText: ns.filter((n) => n !== '').join(', '),
+    pub: ns.some((n) => n === ''),
+  };
+}
+
+function toAcctPayloadItem(it) {
+  const ids = it.nsText.split(',').map((s) => s.trim()).filter((s) => s);
+  return {
+    username: it.username.trim(),
+    password: it.password,
+    action: it.action || '',
+    namespaces: it.pub ? ['', ...ids] : ids,
+  };
+}
+
+function openAcctNew() {
+  acctForm.id = null;
+  acctForm.name = '';
+  acctForm.note = '';
+  acctForm.items = [blankAcctItem()];
+  acctForm.show = true;
+}
+
+function openAcctEdit(t) {
+  acctForm.id = t.id;
+  acctForm.name = t.name;
+  acctForm.note = t.note || '';
+  const list = itemsOf(t).map(toAcctFormItem);
+  acctForm.items = list.length ? list : [blankAcctItem()];
+  acctForm.show = true;
+}
+
+function addAcctRow() {
+  acctForm.items.push(blankAcctItem());
+}
+function removeAcctRow(i) {
+  acctForm.items.splice(i, 1);
+  if (!acctForm.items.length) acctForm.items.push(blankAcctItem());
+}
+
+async function saveAcctTpl() {
+  if (!acctForm.name.trim()) {
+    message.warning('请填写模板名称');
+    return;
+  }
+  const items = acctForm.items.map(toAcctPayloadItem).filter((it) => it.username);
+  if (!items.length) {
+    message.warning('至少填一个账号名');
+    return;
+  }
+  acctForm.saving = true;
+  try {
+    await api.saveNacosAccountTemplate({
+      id: acctForm.id,
+      name: acctForm.name.trim(),
+      note: acctForm.note,
+      items,
+    });
+    message.success('账号模板已保存');
+    acctForm.show = false;
+    await loadAcctTpls();
+  } catch (e) {
+    message.error(e?.response?.data?.error || '保存失败');
+  } finally {
+    acctForm.saving = false;
+  }
+}
+
+async function removeAcctTpl(t) {
+  try {
+    await api.deleteNacosAccountTemplate(t.id);
+    message.success('已删除');
+    await loadAcctTpls();
+  } catch (e) {
+    message.error(e?.response?.data?.error || '删除失败');
+  }
+}
+
+const acctTplColumns = [
+  { title: '模板名称', key: 'name' },
+  {
+    title: '账号数',
+    key: 'items',
+    width: 90,
+    render: (t) => h('span', { class: 'num' }, itemsOf(t).length),
+  },
+  { title: '备注', key: 'note', render: (t) => t.note || '—' },
+  { title: '创建时间', key: 'created_at', width: 170, render: (t) => fmtTime(t.created_at) },
+  {
+    title: '操作',
+    key: 'ops',
+    width: 230,
+    render: (t) =>
+      h('div', { class: 'row-ops' }, [
+        h(NButton, { size: 'tiny', onClick: () => openAcctEdit(t) }, { default: () => '编辑' }),
+        h(
+          NPopconfirm,
+          { onPositiveClick: () => removeAcctTpl(t), positiveText: '删除', negativeText: '取消' },
+          {
+            trigger: () =>
+              h(NButton, { size: 'tiny', type: 'error', tertiary: true }, { default: () => '删除' }),
+            default: () => `确定删除账号模板「${t.name}」?已经落地的远端账号不受影响。`,
+          }
+        ),
+        h(
+          NButton,
+          { size: 'tiny', type: 'primary', onClick: () => openApply(t) },
+          { default: () => '落地到集群' }
+        ),
+      ]),
+  },
+];
+
+// ---- 账号模板落地 ----
+
+const acctApply = reactive({
+  show: false,
+  tpl: null,
+  clusterId: null,
+  running: false,
+  dryRun: false,
+  result: null,
+});
+
+const applyClusterOpts = computed(() =>
+  clusters.value.map((c) => ({
+    label: `${c.name}(${c.env || '未分类'})`,
+    value: c.id,
+    disabled: c.status === 'disabled',
+  }))
+);
+
+function openApply(t) {
+  acctApply.tpl = t;
+  acctApply.clusterId = clusters.value.find((c) => c.status !== 'disabled')?.id || null;
+  acctApply.result = null;
+  acctApply.dryRun = false;
+  acctApply.show = true;
+}
+
+async function runApply(dryRun) {
+  if (!acctApply.clusterId) {
+    message.warning('请先选择目标集群');
+    return;
+  }
+  acctApply.running = true;
+  acctApply.dryRun = dryRun;
+  try {
+    acctApply.result = await api.applyNacosAccounts(acctApply.clusterId, {
+      template_id: acctApply.tpl.id,
+      dry_run: dryRun,
+    });
+    const r = acctApply.result;
+    const tone = r.status === 'ok' ? 'success' : r.status === 'partial' ? 'warning' : 'error';
+    message[tone](
+      `${dryRun ? '试运行' : '落地'}完成:${r.ok_count}/${r.total} 个账号${
+        r.status === 'ok' ? '成功' : r.status === 'partial' ? '部分成功' : '失败'
+      }`
+    );
+  } catch (e) {
+    message.error(e?.response?.data?.error || '落地失败');
+  } finally {
+    acctApply.running = false;
+  }
+}
+
+const APPLY_SUM = {
+  ok: { text: '全部成功', tone: 'ok', icon: 'check' },
+  partial: { text: '部分成功', tone: 'warn', icon: 'alert' },
+  fail: { text: '失败', tone: 'danger', icon: 'close' },
+};
+const applySum = computed(() => APPLY_SUM[acctApply.result?.status] || APPLY_SUM.fail);
+
+/// exists 用 muted 而不是 ok:它不是「做成了什么」,而是「什么都没动」——
+/// 尤其是口令没被覆盖,这点必须让人一眼看出来。
+const ACCT_STATUS = {
+  created: { text: '新建', tone: 'ok', icon: 'plus' },
+  exists: { text: '已存在,未改口令', tone: 'muted', icon: 'skip' },
+  would_create: { text: '将新建', tone: 'muted', icon: 'plus' },
+  fail: { text: '失败', tone: 'danger', icon: 'close' },
+};
+
+const GRANT_STATUS = {
+  ok: { text: '已授权', tone: 'ok' },
+  would_grant: { text: '将授权', tone: 'muted' },
+  skipped: { text: '跳过', tone: 'muted' },
+  fail: { text: '失败', tone: 'danger' },
+};
+
+const applyColumns = [
+  { title: '账号', key: 'username', width: 150, render: (r) => h('span', { class: 'mono' }, r.username) },
+  {
+    title: '状态',
+    key: 'status',
+    width: 150,
+    render: (r) => {
+      const s = ACCT_STATUS[r.status] || { text: r.status, tone: 'muted', icon: 'dot' };
+      return h('span', { class: `pill pill-${s.tone}` }, [
+        h(Icon, { name: s.icon, size: 13 }),
+        h('span', s.text),
+      ]);
+    },
+  },
+  {
+    title: '授权明细',
+    key: 'grants',
+    render: (r) => {
+      const gs = r.grants || [];
+      if (!gs.length) return h('span', { class: 'dim' }, r.message || '未配置命名空间授权');
+      return h(
+        'div',
+        { class: 'grant-lines' },
+        gs.map((g) => {
+          const s = GRANT_STATUS[g.status] || { text: g.status, tone: 'muted' };
+          return h('div', { class: 'grant-line' }, [
+            h('span', { class: 'mono' }, g.namespace_id || 'public'),
+            h('span', { class: 'arw' }, '→'),
+            h('span', { class: 'mono' }, g.resource),
+            h('span', { class: `pill pill-${s.tone}` }, s.text),
+            g.message ? h('span', { class: 'dim' }, g.message) : null,
+          ]);
+        })
+      );
+    },
+  },
+];
+
 onMounted(async () => {
-  await Promise.all([loadClusters(), loadTemplates(), loadRuns(), loadVault()]);
+  await Promise.all([loadClusters(), loadTemplates(), loadRuns(), loadAcctTpls(), loadVault()]);
 });
 </script>
 
@@ -785,6 +1051,46 @@ onMounted(async () => {
               />
             </section>
           </div>
+        </n-card>
+      </n-tab-pane>
+
+      <!-- ============ 账号模板 ============ -->
+      <n-tab-pane name="accounts" tab="账号模板">
+        <n-card size="small" :bordered="false">
+          <template #header>
+            <span class="card-title">账号模板</span>
+            <span class="card-sub">预置账号 + 默认口令 + 要授的命名空间,一键落到任意集群</span>
+          </template>
+          <template #header-extra>
+            <div class="hd-extra">
+              <n-button size="small" :loading="loading.acctTpls" @click="loadAcctTpls">
+                <Icon name="refresh" :size="15" style="margin-right:6px" /> 刷新
+              </n-button>
+              <n-button size="small" type="primary" @click="openAcctNew">
+                <Icon name="plus" :size="15" style="margin-right:6px" /> 新建模板
+              </n-button>
+            </div>
+          </template>
+          <div v-if="!acctTpls.length && !loading.acctTpls" class="empty-page sm">
+            <Icon name="list" :size="26" />
+            <h3>还没有账号模板</h3>
+            <p>把常用的账号、默认口令和要授的命名空间沉淀成模板,新集群一键开号。</p>
+            <n-button type="primary" size="small" @click="openAcctNew">新建账号模板</n-button>
+          </div>
+          <template v-else>
+            <n-data-table
+              :columns="acctTplColumns"
+              :data="acctTpls"
+              :loading="loading.acctTpls"
+              :bordered="false"
+              :scroll-x="860"
+              size="small"
+            />
+            <!-- 口令语义要在动手前说清:落地只补缺,不做「重置」这种破坏性动作 -->
+            <p class="help">
+              落地只补缺:缺失的账号按模板口令新建,<b>已存在的账号不会被重置口令</b>,只补上命名空间授权。
+            </p>
+          </template>
         </n-card>
       </n-tab-pane>
 
@@ -1123,6 +1429,146 @@ onMounted(async () => {
       </template>
     </n-modal>
 
+    <!-- ============ 账号模板编辑 ============ -->
+    <n-modal
+      v-model:show="acctForm.show"
+      preset="card"
+      :title="acctForm.id ? '编辑账号模板' : '新建账号模板'"
+      style="width:940px;max-width:96vw"
+    >
+      <n-form label-placement="top" :show-feedback="false">
+        <div class="f-grid">
+          <n-form-item label="模板名称" required>
+            <n-input v-model:value="acctForm.name" placeholder="如:业务只读账号包" />
+          </n-form-item>
+          <n-form-item label="备注">
+            <n-input v-model:value="acctForm.note" placeholder="适用范围 / 交付对象" />
+          </n-form-item>
+        </div>
+        <n-form-item label="账号">
+          <div class="acct-rows">
+            <div class="acct-hd">
+              <span>账号名</span>
+              <span>默认口令</span>
+              <span>动作</span>
+              <span>命名空间 id(逗号分隔)</span>
+              <span>public</span>
+              <span />
+            </div>
+            <!-- 用户名/口令都显式带 name + autocomplete:
+                 否则 Chrome 会把 opsctl 自己的登录凭据灌进这两个框,写出错的远端账号 -->
+            <div v-for="(it, i) in acctForm.items" :key="i" class="acct-row">
+              <n-input
+                v-model:value="it.username"
+                class="mono"
+                placeholder="如 order-ro"
+                :input-props="{ name: 'nacos-tpl-user', autocomplete: 'off' }"
+              />
+              <n-input
+                v-model:value="it.password"
+                type="password"
+                show-password-on="click"
+                placeholder="仅新建时使用"
+                :input-props="{ name: 'nacos-tpl-secret', autocomplete: 'new-password' }"
+              />
+              <n-select v-model:value="it.action" :options="ACCT_ACTION_OPTS" />
+              <n-input v-model:value="it.nsText" class="mono" placeholder="dev-ns, test-ns" />
+              <n-checkbox v-model:checked="it.pub">含</n-checkbox>
+              <n-button
+                size="tiny"
+                quaternary
+                type="error"
+                :aria-label="`删除第 ${i + 1} 行账号`"
+                @click="removeAcctRow(i)"
+              >
+                <Icon name="minus" :size="14" />
+              </n-button>
+            </div>
+            <div class="acct-add">
+              <n-button size="tiny" dashed @click="addAcctRow">
+                <Icon name="plus" :size="13" style="margin-right:4px" /> 添加账号
+              </n-button>
+              <span class="help">
+                public 的命名空间 id 是空串,看不见也打不出来,所以单独给了「含」这个勾选。
+              </span>
+            </div>
+            <p class="help">
+              每个账号按<b>整个命名空间</b>授权;要精确到某个分组或单条配置,请去集群管理页单独授。
+            </p>
+          </div>
+        </n-form-item>
+      </n-form>
+      <template #footer>
+        <div class="modal-ft">
+          <span class="sp" />
+          <n-button size="small" @click="acctForm.show = false">取消</n-button>
+          <n-button size="small" type="primary" :loading="acctForm.saving" @click="saveAcctTpl">保存</n-button>
+        </div>
+      </template>
+    </n-modal>
+
+    <!-- ============ 账号模板落地 ============ -->
+    <n-modal
+      v-model:show="acctApply.show"
+      preset="card"
+      :title="`落地账号模板「${acctApply.tpl?.name || ''}」`"
+      style="width:880px;max-width:96vw"
+    >
+      <div class="apply-bar">
+        <n-select
+          v-model:value="acctApply.clusterId"
+          :options="applyClusterOpts"
+          placeholder="选择目标集群"
+          filterable
+          style="width:300px"
+        />
+        <n-button size="small" :loading="acctApply.running && acctApply.dryRun" @click="runApply(true)">
+          <Icon name="eye" :size="14" style="margin-right:6px" /> 试运行
+        </n-button>
+        <n-button
+          size="small"
+          type="primary"
+          :loading="acctApply.running && !acctApply.dryRun"
+          @click="runApply(false)"
+        >
+          <Icon name="play" :size="14" style="margin-right:6px" /> 执行
+        </n-button>
+      </div>
+      <p class="help">
+        试运行只算不写。执行时:缺失的账号按模板口令新建,<b>已存在的账号不会被重置口令</b>,只补上命名空间授权。
+      </p>
+
+      <template v-if="acctApply.result">
+        <div class="res-sum" style="margin-top:12px">
+          <span class="pill" :class="`pill-${applySum.tone}`">
+            <Icon :name="applySum.icon" :size="13" />
+            <span>{{ applySum.text }}</span>
+          </span>
+          <span>
+            共 <b class="num">{{ acctApply.result.total }}</b> 个账号 ·
+            成功 <b class="num">{{ acctApply.result.ok_count }}</b>
+          </span>
+          <span v-if="acctApply.result.dry_run" class="pill pill-muted">试运行(未写入)</span>
+          <span v-if="acctApply.result.template_name" class="dim">{{ acctApply.result.template_name }}</span>
+        </div>
+        <n-data-table
+          :columns="applyColumns"
+          :data="acctApply.result.items || []"
+          :bordered="false"
+          :scroll-x="720"
+          size="small"
+          style="margin-top:12px"
+        />
+      </template>
+
+      <template #footer>
+        <div class="modal-ft">
+          <span class="sp" />
+          <n-button size="small" @click="acctApply.show = false">关闭</n-button>
+        </div>
+      </template>
+    </n-modal>
+
     <!-- ============ 记录详情 ============ -->
     <n-drawer v-model:show="runDrawer.show" :width="700" placement="right">
       <n-drawer-content title="初始化记录详情" closable>
@@ -1287,6 +1733,23 @@ onMounted(async () => {
 .kv-grid span { color: var(--muted); }
 .kv-grid b { color: var(--fg); font-weight: 550; }
 
+/* ---- 账号模板 ---- */
+.hd-extra { display: flex; align-items: center; gap: 8px; }
+.acct-rows { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.acct-hd, .acct-row { display: grid; gap: 8px; align-items: center;
+  grid-template-columns: 1.1fr 1.1fr 112px 1.6fr 58px 34px; }
+.acct-hd { font-size: 11.5px; color: var(--muted); }
+.acct-add { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.acct-add .help { margin: 0; }
+.acct-rows .help b { color: var(--fg-2); font-weight: 620; }
+.apply-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.res-sum b { color: var(--fg); font-weight: 620; }
+/* 授权明细走表格单元格,所以要穿透 scoped */
+:deep(.grant-lines) { display: flex; flex-direction: column; gap: 3px; padding: 2px 0; }
+:deep(.grant-line) { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-size: 11.5px; color: var(--fg-2); }
+:deep(.grant-line .arw) { color: var(--muted); }
+
 /* ---- 排版细节 ---- */
 .mono, :deep(.mono) { font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Consolas, monospace; }
 .num, :deep(.num) { font-variant-numeric: tabular-nums; }
@@ -1304,6 +1767,9 @@ onMounted(async () => {
   .f-grid { grid-template-columns: 1fr; }
   .kv-grid { grid-template-columns: 88px 1fr; }
   .acts { margin-left: 0; width: 100%; }
+  /* 窄屏放弃表头对齐,一行拆两列,免得输入框被挤成条 */
+  .acct-hd { display: none; }
+  .acct-row { grid-template-columns: 1fr 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

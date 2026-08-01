@@ -305,6 +305,18 @@ pub struct NacosRunRow {
     pub ts: i64,
 }
 
+/// 一组预置账号:用户名 + 默认口令 + 要授到哪些命名空间。
+/// 目的是「照着单子把人开出来」,而不是每次手点一遍。
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct NacosAccountTemplateRow {
+    pub id: String,
+    pub name: String,
+    pub note: String,
+    /// json: `[{username,password,action,namespaces:[..],group,kind,name}]`
+    pub items: String,
+    pub created_at: i64,
+}
+
 impl Store {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = SqlitePoolOptions::new()
@@ -493,6 +505,14 @@ impl Store {
             created_at INTEGER NOT NULL DEFAULT 0,
             literal INTEGER NOT NULL DEFAULT 0,           -- 1 = 原文下发,不做变量代入
             namespace TEXT NOT NULL DEFAULT ''            -- 归属/默认目标命名空间
+        );
+        CREATE TABLE IF NOT EXISTS nacos_account_templates (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            -- json: [{username,password,action,namespaces:[...],group,kind,name}]
+            items TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS nacos_init_runs (
             id TEXT PRIMARY KEY,
@@ -1327,6 +1347,38 @@ impl Store {
 
     pub async fn delete_nacos_template(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM nacos_config_templates WHERE id = ?")
+            .bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // ---- 账号模板:一组预置的账号 + 默认口令 + 要授的命名空间 ----
+
+    pub async fn list_nacos_account_templates(&self) -> Result<Vec<NacosAccountTemplateRow>> {
+        Ok(sqlx::query_as::<_, NacosAccountTemplateRow>(
+            "SELECT * FROM nacos_account_templates ORDER BY created_at DESC")
+            .fetch_all(&self.pool).await?)
+    }
+
+    pub async fn get_nacos_account_template(
+        &self,
+        id: &str,
+    ) -> Result<Option<NacosAccountTemplateRow>> {
+        Ok(sqlx::query_as::<_, NacosAccountTemplateRow>(
+            "SELECT * FROM nacos_account_templates WHERE id = ?")
+            .bind(id).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn save_nacos_account_template(&self, t: &NacosAccountTemplateRow) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO nacos_account_templates (id,name,note,items,created_at) \
+             VALUES (?,?,?,?,?)")
+            .bind(&t.id).bind(&t.name).bind(&t.note).bind(&t.items).bind(t.created_at)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn delete_nacos_account_template(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM nacos_account_templates WHERE id = ?")
             .bind(id).execute(&self.pool).await?;
         Ok(())
     }

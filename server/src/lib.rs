@@ -137,6 +137,16 @@ pub fn build_router(state: AppState) -> Router {
             "/nacos/clusters/{id}/grant",
             post(nacos::grant_user).delete(nacos::revoke_user),
         )
+        .route("/nacos/clusters/{id}/grant/batch", post(nacos::grant_user_batch))
+        .route("/nacos/clusters/{id}/accounts/apply", post(nacos::apply_accounts))
+        .route(
+            "/nacos/account-templates",
+            get(nacos::list_account_templates).post(nacos::save_account_template),
+        )
+        .route(
+            "/nacos/account-templates/{id}",
+            axum::routing::delete(nacos::delete_account_template),
+        )
         .route(
             "/nacos/clusters/{id}/users/{username}",
             axum::routing::delete(nacos::delete_user_api),

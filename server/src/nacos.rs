@@ -2214,6 +2214,38 @@ fn resource_namespace(resource: &str) -> String {
     resource.split(':').next().unwrap_or_default().to_string()
 }
 
+/// 已存在的 (role, resource, action) 三元组。
+///
+/// Nacos 的 permissions 表对这三列有唯一约束,重复插入会报错;而「批量 / 模板」的前提
+/// 就是可以反复执行。所以下发前先拉一次现状,已经有的直接跳过,别把重跑变成一堆失败。
+async fn existing_grants(ctx: &AdminCtx) -> Vec<(String, String, String)> {
+    match list_permissions(ctx, 1, 500, "").await {
+        Ok((_, rows)) => rows
+            .iter()
+            .map(|p| (str_at(p, "role"), str_at(p, "resource"), str_at(p, "action")))
+            .collect(),
+        // 拉不到就当没有:后续真重复了由服务端报错,不比现在更差
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 幂等赋权:已存在返回 `Ok(false)`(未写入),新增返回 `Ok(true)`。
+async fn grant_if_absent(
+    ctx: &AdminCtx,
+    known: &mut Vec<(String, String, String)>,
+    role: &str,
+    resource: &str,
+    action: &str,
+) -> Result<bool, String> {
+    let key = (role.to_string(), resource.to_string(), action.to_string());
+    if known.contains(&key) {
+        return Ok(false);
+    }
+    grant_permission(ctx, role, resource, action).await?;
+    known.push(key);
+    Ok(true)
+}
+
 /// 该用户绑定的角色(排除 ROLE_ADMIN —— 那是全局管理员,不由这里管理)。
 async fn roles_of(ctx: &AdminCtx, username: &str) -> Result<(Vec<String>, bool), String> {
     let (_, rows) = list_roles(ctx, 1, 500).await?;
@@ -2263,7 +2295,7 @@ pub async fn user_access(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct GrantReq {
     pub username: String,
     /// 命名空间 id;空串 = public
@@ -2271,6 +2303,46 @@ pub struct GrantReq {
     pub namespace_id: String,
     /// r | w | rw
     pub action: String,
+    /// 配置分组 / 服务分组,留空或 `*` = 全部
+    #[serde(default)]
+    pub group: String,
+    /// 资源类型:`config`(配置)| `naming`(服务)| `*`(两者都要)
+    #[serde(default)]
+    pub kind: String,
+    /// dataId / serviceName,留空或 `*` = 全部
+    #[serde(default)]
+    pub name: String,
+}
+
+/// 按 Nacos 的资源模型拼资源串:`<namespaceId>:<group>:<type>/<name>`
+/// (源码 `NacosRoleServiceImpl#joinResource`,分隔符 `:`、通配 `*`)。
+///
+/// 三个要点,少一个权限就形同虚设:
+/// - public 的 id 是空串 → 首段留空,控制台写出来就是 `:*:*`
+/// - 不区分配置/服务时,第三段**整体**塌缩成 `*`,而不是 `*/\*` —— 授权判定是把存储的
+///   资源串按 `*`→`.*` 变成正则去整串匹配,写错第三段就永远匹配不上
+/// - group / name 留空一律按 `*`
+fn build_resource(namespace_id: &str, group: &str, kind: &str, name: &str) -> String {
+    let g = {
+        let g = group.trim();
+        if g.is_empty() { "*" } else { g }
+    };
+    let k = kind.trim();
+    if k.is_empty() || k == "*" {
+        return format!("{namespace_id}:{g}:*");
+    }
+    let n = {
+        let n = name.trim();
+        if n.is_empty() { "*" } else { n }
+    };
+    format!("{namespace_id}:{g}:{k}/{n}")
+}
+
+fn validate_kind(kind: &str) -> Result<(), String> {
+    match kind.trim() {
+        "" | "*" | "config" | "naming" => Ok(()),
+        _ => Err("资源类型只能是 config(配置)、naming(服务)或 *(全部)".into()),
+    }
 }
 
 /// 这个用户在这个集群上的「工作角色」:已有非 ROLE_ADMIN 角色就复用第一个,
@@ -2279,8 +2351,8 @@ fn work_role(username: &str, roles: &[String]) -> String {
     roles.first().cloned().unwrap_or_else(|| format!("{username}-role"))
 }
 
-/// `POST /nacos/clusters/{id}/grant` — 一步授权:选账号 + 命名空间 + 读写,
-/// 缺角色就自动创建并绑定,再赋权到 `<ns>:*:*`(Nacos 控制台也只写这一种资源串)。
+/// `POST /nacos/clusters/{id}/grant` — 一步授权:选账号 + 命名空间 + 读写(+ 可选的
+/// group / 类型 / 名称),缺角色就自动创建并绑定,再按 Nacos 的资源模型赋权。
 pub async fn grant_user(
     user: AuthUser,
     State(st): State<AppState>,
@@ -2290,6 +2362,7 @@ pub async fn grant_user(
     admin(&user)?;
     let (c, ctx) = ctx_for(&st, &id).await?;
     validate_action(&req.action).map_err(AppError::BadRequest)?;
+    validate_kind(&req.kind).map_err(AppError::BadRequest)?;
     if req.username.trim().is_empty() {
         return Err(AppError::BadRequest("请选择账号".into()));
     }
@@ -2302,18 +2375,19 @@ pub async fn grant_user(
     }
     let role = work_role(&req.username, &roles);
     let created_role = roles.is_empty();
-    let resource = format!("{}:*:*", req.namespace_id);
+    let resource = build_resource(&req.namespace_id, &req.group, &req.kind, &req.name);
 
     let payload = json!({
-        "username": req.username, "namespace_id": req.namespace_id,
+        "username": req.username, "namespace_id": req.namespace_id, "resource": resource,
         "action": req.action, "role": role, "created_role": created_role
     });
     // 顺序不能反:Nacos 赋权时要求角色已存在,否则 400 "role X not found!"
+    let mut known = existing_grants(&ctx).await;
     let outcome = async {
         if created_role {
             bind_role(&ctx, &role, &req.username).await?;
         }
-        grant_permission(&ctx, &role, &resource, &req.action).await
+        grant_if_absent(&ctx, &mut known, &role, &resource, &req.action).await.map(|_| ())
     }
     .await;
 
@@ -2335,12 +2409,14 @@ pub async fn grant_user(
     }
 }
 
-/// `DELETE /nacos/clusters/{id}/grant?username=&namespace_id=&action=` — 收回这条授权。
+/// `DELETE /nacos/clusters/{id}/grant?username=&namespace_id=&action=[&group=&kind=&name=]`
+/// —— 收回这条授权。资源串必须和写入时**逐字一致**,否则 Nacos 找不到那一行。
+/// 所以调用方应把列表里回读到的 `resource` 原样传回来(`resource` 参数优先)。
 pub async fn revoke_user(
     user: AuthUser,
     State(st): State<AppState>,
     Path(id): Path<String>,
-    Query(q): Query<GrantReq>,
+    Query(q): Query<RevokeReq>,
 ) -> Result<Json<Value>, AppError> {
     admin(&user)?;
     let (c, ctx) = ctx_for(&st, &id).await?;
@@ -2348,7 +2424,10 @@ pub async fn revoke_user(
     if roles.is_empty() {
         return Err(AppError::BadRequest("该账号没有可收回的角色".into()));
     }
-    let resource = format!("{}:*:*", q.namespace_id);
+    let resource = match q.resource.as_ref().filter(|r| !r.trim().is_empty()) {
+        Some(r) => r.trim().to_string(),
+        None => build_resource(&q.namespace_id, &q.group, &q.kind, &q.name),
+    };
     let mut last_err = None;
     let mut done_any = false;
     for role in &roles {
@@ -2357,15 +2436,401 @@ pub async fn revoke_user(
             Err(e) => last_err = Some(e),
         }
     }
-    let payload =
-        json!({ "username": q.username, "namespace_id": q.namespace_id, "action": q.action });
+    let payload = json!({ "username": q.username, "resource": resource, "action": q.action });
     let out = if done_any { Ok(()) } else { Err(last_err.unwrap_or_else(|| "收回失败".into())) };
     done(&st, &user, &c, "nacos_revoke", payload, out).await
+}
+
+#[derive(Deserialize)]
+pub struct RevokeReq {
+    pub username: String,
+    #[serde(default)]
+    pub namespace_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+    /// 列表里回读到的资源串,原样传回最稳妥
+    #[serde(default)]
+    pub resource: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct BatchGrantReq {
+    pub username: String,
+    /// 一次给多个命名空间授同一份权限(空串 = public)
+    pub namespaces: Vec<String>,
+    pub action: String,
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// `POST /nacos/clusters/{id}/grant/batch` — 同一个账号 × 多个命名空间,一次授完。
+/// 角色只建一次;逐个命名空间报结果,某个失败不影响其它。
+pub async fn grant_user_batch(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<BatchGrantReq>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    let (c, ctx) = ctx_for(&st, &id).await?;
+    validate_action(&req.action).map_err(AppError::BadRequest)?;
+    validate_kind(&req.kind).map_err(AppError::BadRequest)?;
+    if req.username.trim().is_empty() {
+        return Err(AppError::BadRequest("请选择账号".into()));
+    }
+    if req.namespaces.is_empty() {
+        return Err(AppError::BadRequest("请至少选择一个命名空间".into()));
+    }
+
+    let (roles, is_admin) = roles_of(&ctx, &req.username).await.map_err(AppError::BadRequest)?;
+    if is_admin && roles.is_empty() {
+        return Err(AppError::BadRequest(
+            "该账号是全局管理员(ROLE_ADMIN),已拥有全部权限,无需单独授权".into(),
+        ));
+    }
+    let role = work_role(&req.username, &roles);
+    let mut created_role = false;
+    if roles.is_empty() {
+        bind_role(&ctx, &role, &req.username).await.map_err(AppError::BadRequest)?;
+        created_role = true;
+    }
+
+    let mut known = existing_grants(&ctx).await;
+    let mut items = Vec::with_capacity(req.namespaces.len());
+    let mut ok_count = 0;
+    for ns in &req.namespaces {
+        let resource = build_resource(ns, &req.group, &req.kind, &req.name);
+        match grant_if_absent(&ctx, &mut known, &role, &resource, &req.action).await {
+            Ok(added) => {
+                ok_count += 1;
+                items.push(json!({
+                    "namespace_id": ns, "resource": resource,
+                    "status": if added { "ok" } else { "exists" },
+                    "message": if added { "" } else { "已有相同授权,未重复写入" }
+                }));
+            }
+            Err(e) => items.push(json!({
+                "namespace_id": ns, "resource": resource, "status": "fail", "message": e
+            })),
+        }
+    }
+    let total = items.len() as i64;
+    let status = if ok_count == total {
+        "ok"
+    } else if ok_count == 0 {
+        "fail"
+    } else {
+        "partial"
+    };
+    audit_admin(
+        &st,
+        &user,
+        &c,
+        "nacos_grant_batch",
+        json!({
+            "username": req.username, "role": role, "action": req.action,
+            "total": total, "ok_count": ok_count, "items": items
+        }),
+        status,
+    )
+    .await;
+    Ok(Json(json!({
+        "ok": ok_count > 0, "status": status, "role": role, "created_role": created_role,
+        "total": total, "ok_count": ok_count, "items": items
+    })))
+}
+
+// ---- 账号模板:照着单子把人开出来 ----
+
+/// 模板里的一条:账号 + 默认口令 + 要授到哪些命名空间。
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct AccountItem {
+    pub username: String,
+    /// 默认口令。真要上生产应逐个改掉,这里只是让「批量开号」可执行。
+    #[serde(default)]
+    pub password: String,
+    /// r | w | rw;留空 = 只建账号不授权
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+pub async fn list_account_templates(
+    user: AuthUser,
+    State(st): State<AppState>,
+) -> Result<Json<Vec<crate::store::NacosAccountTemplateRow>>, AppError> {
+    admin(&user)?;
+    Ok(Json(st.store.list_nacos_account_templates().await.map_err(AppError::Internal)?))
+}
+
+#[derive(Deserialize)]
+pub struct SaveAccountTemplate {
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub items: Vec<AccountItem>,
+}
+
+pub async fn save_account_template(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Json(req): Json<SaveAccountTemplate>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    if req.name.trim().is_empty() {
+        return Err(AppError::BadRequest("请填写模板名称".into()));
+    }
+    for it in &req.items {
+        if it.username.trim().is_empty() {
+            return Err(AppError::BadRequest("账号名不能为空".into()));
+        }
+        if !it.action.trim().is_empty() {
+            validate_action(it.action.trim()).map_err(AppError::BadRequest)?;
+        }
+        validate_kind(&it.kind).map_err(AppError::BadRequest)?;
+    }
+    let id = req.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+    let created_at = match st
+        .store
+        .get_nacos_account_template(&id)
+        .await
+        .map_err(AppError::Internal)?
+    {
+        Some(old) => old.created_at,
+        None => now_secs(),
+    };
+    st.store
+        .save_nacos_account_template(&crate::store::NacosAccountTemplateRow {
+            id: id.clone(),
+            name: req.name.trim().to_string(),
+            note: req.note,
+            items: serde_json::to_string(&req.items).unwrap_or_else(|_| "[]".into()),
+            created_at,
+        })
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(json!({ "id": id })))
+}
+
+pub async fn delete_account_template(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    st.store.delete_nacos_account_template(&id).await.map_err(AppError::Internal)?;
+    Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+pub struct ApplyAccountsReq {
+    #[serde(default)]
+    pub template_id: Option<String>,
+    #[serde(default)]
+    pub items: Vec<AccountItem>,
+    /// 只报告要做什么,不写远端
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST /nacos/clusters/{id}/accounts/apply` — 把账号模板落到集群上:
+/// 建账号(已存在则跳过,**不会重置别人的口令**)→ 建角色 → 逐个命名空间赋权。
+pub async fn apply_accounts(
+    user: AuthUser,
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ApplyAccountsReq>,
+) -> Result<Json<Value>, AppError> {
+    admin(&user)?;
+    let (c, ctx) = ctx_for(&st, &id).await?;
+
+    let (items, tpl_name) = if !req.items.is_empty() {
+        (req.items.clone(), String::new())
+    } else if let Some(tid) = req.template_id.clone().filter(|t| !t.is_empty()) {
+        let t = st
+            .store
+            .get_nacos_account_template(&tid)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::BadRequest("账号模板不存在".into()))?;
+        let parsed: Vec<AccountItem> = serde_json::from_str(&t.items)
+            .map_err(|e| AppError::BadRequest(format!("模板条目无法解析:{e}")))?;
+        (parsed, t.name)
+    } else {
+        (Vec::new(), String::new())
+    };
+    if items.is_empty() {
+        return Err(AppError::BadRequest("没有要创建的账号".into()));
+    }
+
+    // 已有账号/角色先拉一次,避免逐条去问
+    let (_, existing) = list_users(&ctx, 1, 500).await.map_err(AppError::BadRequest)?;
+    let existing: Vec<String> = existing.iter().map(|u| str_at(u, "username")).collect();
+    // 现有授权先拉一次:重跑模板时已有的直接跳过,不去撞 Nacos 的唯一约束
+    let mut known_grants = existing_grants(&ctx).await;
+
+    let mut results = Vec::with_capacity(items.len());
+    let mut ok_count = 0i64;
+    for it in &items {
+        let username = it.username.trim().to_string();
+        let mut grants = Vec::new();
+        let mut failed = false;
+
+        let already = existing.contains(&username);
+        let user_status = if already {
+            "exists"
+        } else if req.dry_run {
+            "would_create"
+        } else {
+            match create_user(&ctx, &username, &it.password).await {
+                Ok(()) => "created",
+                Err(e) => {
+                    failed = true;
+                    results.push(json!({
+                        "username": username, "status": "fail", "message": e, "grants": []
+                    }));
+                    continue;
+                }
+            }
+        };
+
+        // 授权(action 留空 = 只建号)
+        if !it.action.trim().is_empty() && !it.namespaces.is_empty() {
+            let (roles, is_admin) =
+                roles_of(&ctx, &username).await.unwrap_or_else(|_| (Vec::new(), false));
+            let role = work_role(&username, &roles);
+            if is_admin && roles.is_empty() {
+                grants.push(json!({
+                    "namespace_id": "*", "status": "skipped",
+                    "message": "全局管理员,无需逐个命名空间授权"
+                }));
+            } else {
+                if roles.is_empty() && !req.dry_run {
+                    if let Err(e) = bind_role(&ctx, &role, &username).await {
+                        failed = true;
+                        grants.push(json!({
+                            "namespace_id": "*", "status": "fail", "message": e
+                        }));
+                    }
+                }
+                for ns in &it.namespaces {
+                    let resource = build_resource(ns, &it.group, &it.kind, &it.name);
+                    if req.dry_run {
+                        grants.push(json!({
+                            "namespace_id": ns, "resource": resource,
+                            "status": "would_grant", "message": ""
+                        }));
+                        continue;
+                    }
+                    match grant_if_absent(&ctx, &mut known_grants, &role, &resource, it.action.trim())
+                        .await
+                    {
+                        Ok(added) => grants.push(json!({
+                            "namespace_id": ns, "resource": resource,
+                            "status": if added { "ok" } else { "exists" },
+                            "message": if added { "" } else { "已有相同授权" }
+                        })),
+                        Err(e) => {
+                            failed = true;
+                            grants.push(json!({
+                                "namespace_id": ns, "resource": resource,
+                                "status": "fail", "message": e
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !failed {
+            ok_count += 1;
+        }
+        results.push(json!({
+            "username": username,
+            "status": if failed { "fail" } else { user_status },
+            "message": "",
+            "grants": grants,
+        }));
+    }
+
+    let total = results.len() as i64;
+    let status = if ok_count == total {
+        "ok"
+    } else if ok_count == 0 {
+        "fail"
+    } else {
+        "partial"
+    };
+    if !req.dry_run {
+        audit_admin(
+            &st,
+            &user,
+            &c,
+            "nacos_accounts_apply",
+            json!({
+                "template": tpl_name, "total": total, "ok_count": ok_count, "items": results
+            }),
+            status,
+        )
+        .await;
+    }
+    Ok(Json(json!({
+        "ok": ok_count > 0, "status": status, "dry_run": req.dry_run,
+        "template_name": tpl_name, "total": total, "ok_count": ok_count, "items": results
+    })))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_follows_nacos_join_rules() {
+        // 整个命名空间(控制台唯一会写的形状)
+        assert_eq!(build_resource("dev-ns", "", "", ""), "dev-ns:*:*");
+        assert_eq!(build_resource("dev-ns", "*", "*", "*"), "dev-ns:*:*");
+        // public 的 id 是空串 → 首段留空
+        assert_eq!(build_resource("", "", "", ""), ":*:*");
+        // 限定分组:第三段仍整体塌缩成 *
+        assert_eq!(build_resource("dev-ns", "DEFAULT_GROUP", "*", "app.yaml"), "dev-ns:DEFAULT_GROUP:*");
+        // 限定类型后才带 <type>/<name>
+        assert_eq!(
+            build_resource("dev-ns", "DEFAULT_GROUP", "config", "app.yaml"),
+            "dev-ns:DEFAULT_GROUP:config/app.yaml"
+        );
+        assert_eq!(build_resource("dev-ns", "", "config", ""), "dev-ns:*:config/*");
+        assert_eq!(build_resource("dev-ns", "G", "naming", "order-svc"), "dev-ns:G:naming/order-svc");
+        // 两侧空白不该混进资源串
+        assert_eq!(build_resource("dev-ns", " G ", " config ", " a.yaml "), "dev-ns:G:config/a.yaml");
+    }
+
+    #[test]
+    fn kind_whitelist_rejects_typos() {
+        for ok in ["", "*", "config", "naming"] {
+            assert!(validate_kind(ok).is_ok(), "{ok} 应被接受");
+        }
+        // 写错类型服务端不会报错,但授权判定永远匹配不上 —— 必须本地挡住
+        assert!(validate_kind("configs").is_err());
+        assert!(validate_kind("cs").is_err());
+    }
 
     #[test]
     fn base_urls_normalize_scheme_port_and_context() {

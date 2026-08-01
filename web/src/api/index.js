@@ -140,11 +140,20 @@ export const api = {
   // ---- Nacos 权限:以「账号」为中心的视图 + 一步授权/收回(角色由后端自动补齐)----
   nacosUserAccess: (id, name) => http.get(`/nacos/clusters/${id}/users/${encodeURIComponent(name)}/access`).then((r) => r.data),
   grantNacosUser: (id, body) => http.post(`/nacos/clusters/${id}/grant`, body).then((r) => r.data),
+  /// 一个账号一次授到多个命名空间:后端逐个下发、逐条回结果,所以可能部分成功。
+  grantNacosUserBatch: (id, body) => http.post(`/nacos/clusters/${id}/grant/batch`, body).then((r) => r.data),
+  /// 收回必须带列表里回读到的 resource 原串:Nacos 的资源串是逐字匹配的,
+  /// 自己按命名空间重新拼一遍只要有一段不同(group / 类型 / 名称)就删不掉那一行。
   revokeNacosUser: (id, params) => http.delete(`/nacos/clusters/${id}/grant`, { params }).then((r) => r.data),
   // ---- Nacos 配置:读正文 / 删除 / 整库同步为模板 ----
   nacosConfigDetail: (id, params) => http.get(`/nacos/clusters/${id}/configs/detail`, { params }).then((r) => r.data),
   deleteNacosConfig: (id, params) => http.delete(`/nacos/clusters/${id}/configs`, { params }).then((r) => r.data),
   syncNacosConfigs: (id, body) => http.post(`/nacos/clusters/${id}/sync`, body).then((r) => r.data),
+  // ---- Nacos 账号模板:预置一组账号 + 要授的命名空间,一键落到任意集群 ----
+  nacosAccountTemplates: () => http.get('/nacos/account-templates').then((r) => r.data),
+  saveNacosAccountTemplate: (body) => http.post('/nacos/account-templates', body).then((r) => r.data),
+  deleteNacosAccountTemplate: (id) => http.delete(`/nacos/account-templates/${id}`).then((r) => r.data),
+  applyNacosAccounts: (id, body) => http.post(`/nacos/clusters/${id}/accounts/apply`, body).then((r) => r.data),
 };
 
 export default http;
