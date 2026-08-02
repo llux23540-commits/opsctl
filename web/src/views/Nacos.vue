@@ -1148,10 +1148,10 @@ onMounted(async () => {
             class="mono"
             type="textarea"
             :autosize="{ minRows: 2, maxRows: 4 }"
-            placeholder="10.0.0.1:8848,10.0.0.2:8848(逗号分隔,省略端口按 8848)"
+            placeholder="10.0.0.1:8848,nacos.example.com:80(逗号分隔)"
           />
           <p v-if="form.errors.server_addr" class="err">{{ form.errors.server_addr }}</p>
-          <p v-else class="help">支持 host、host:port 或完整 URL;仅 http,暂不支持 IPv6 字面量。</p>
+          <p v-else class="help">支持 host、host:port 或完整 URL;裸 host 默认端口 8848,写 http://host 则按 URL 语义走 80(反代部署)。IPv6 写 [2001:db8::1]:8848,裸写不带端口亦可。仅 http,暂不支持 https。</p>
         </n-form-item>
 
         <div class="f-grid">

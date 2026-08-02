@@ -52,47 +52,114 @@ pub struct NacosConn {
 
 /// `10.0.0.1, http://n2:8848/nacos` + ctx `/nacos`
 /// → `["http://10.0.0.1:8848/nacos", "http://n2:8848/nacos"]`.
+///
+/// 端口缺省规则:裸 `host` 按 Nacos 惯例补 8848;写明 scheme 的
+/// `http(s)://host` 按 URL 语义走 80/443(反代部署常见)。
 pub fn base_urls(server_addr: &str, context_path: &str) -> Vec<String> {
-    let ctx = {
-        let c = context_path.trim().trim_end_matches('/');
-        if c.is_empty() {
-            String::new()
-        } else if c.starts_with('/') {
-            c.to_string()
-        } else {
-            format!("/{c}")
-        }
-    };
+    let ctx = norm_ctx(context_path);
     server_addr
         .split(',')
         .filter_map(|raw| normalize_base(raw, &ctx))
         .collect()
 }
 
-fn normalize_base(raw: &str, ctx: &str) -> Option<String> {
+/// `"nacos"` / `"/nacos/"` → `"/nacos"`;空白 → `""`。
+fn norm_ctx(context_path: &str) -> String {
+    let c = context_path.trim().trim_end_matches('/');
+    if c.is_empty() {
+        String::new()
+    } else if c.starts_with('/') {
+        c.to_string()
+    } else {
+        format!("/{c}")
+    }
+}
+
+/// One parsed entry of `server_addr`. `scheme_explicit` 决定缺省端口语义:
+/// 裸 `host` 是「Nacos 地址」(默认 8848),`http(s)://host` 是 URL(默认 80/443)。
+struct AddrParts<'a> {
+    scheme: &'a str,
+    scheme_explicit: bool,
+    host: &'a str,
+    port: Option<&'a str>,
+    /// 地址自带的路径(已去尾部 `/`);为空时用集群的 context path。
+    path: &'a str,
+}
+
+fn parse_addr(raw: &str) -> Option<AddrParts<'_>> {
     let s = raw.trim().trim_end_matches('/');
     if s.is_empty() {
         return None;
     }
-    let (scheme, rest) = match s.split_once("://") {
-        Some((sc, r)) => (sc, r),
-        None => ("http", s),
+    let (scheme, scheme_explicit, rest) = match s.split_once("://") {
+        Some((sc, r)) => (sc, true, r),
+        None => ("http", false, s),
     };
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
         None => (rest, ""),
     };
-    if hostport.is_empty() {
+    // IPv6 字面量:标准写法带括号 `[::1]:8848`;裸写 `2001:db8::1`(多个冒号、
+    // 无括号)整体视作 host、没写端口。其余按 `host[:port]` 拆。
+    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
+        let (h, tail) = inner.split_once(']')?; // 括号不闭合 → 整条地址无效
+        let port = match tail {
+            "" => None,
+            t => Some(t.strip_prefix(':')?), // `]` 后只允许 `:port`
+        };
+        (h, port)
+    } else if hostport.matches(':').count() > 1 {
+        (hostport, None)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        }
+    };
+    if host.is_empty() {
         return None;
     }
-    let hostport = if hostport.contains(':') {
-        hostport.to_string()
+    Some(AddrParts { scheme, scheme_explicit, host, port, path })
+}
+
+/// URL/`host:port` 场景下的主机写法:IPv6 字面量必须带括号。
+fn host_disp(host: &str) -> String {
+    if host.contains(':') { format!("[{host}]") } else { host.to_string() }
+}
+
+fn default_port(p: &AddrParts) -> &'static str {
+    if !p.scheme_explicit {
+        "8848" // Nacos 惯例:裸 host 视作 Nacos 服务地址
+    } else if p.scheme.eq_ignore_ascii_case("https") {
+        "443"
     } else {
-        format!("{hostport}:8848")
-    };
+        "80" // 写明了 scheme 就按 URL 语义走标准端口
+    }
+}
+
+fn assemble(p: &AddrParts, port: &str, ctx: &str) -> String {
     // an address that already carries a path keeps it; otherwise use the context
-    let path = if path.is_empty() { ctx } else { path };
-    Some(format!("{scheme}://{hostport}{path}"))
+    let path = if p.path.is_empty() { ctx } else { p.path };
+    format!("{}://{}:{}{}", p.scheme, host_disp(p.host), port, path)
+}
+
+fn normalize_base(raw: &str, ctx: &str) -> Option<String> {
+    let p = parse_addr(raw)?;
+    let port = p.port.unwrap_or_else(|| default_port(&p));
+    Some(assemble(&p, port, ctx))
+}
+
+/// 没写端口的地址,探测失败时值得按「另一种惯例」再试:裸 host(默认 8848)
+/// 试 80;`http(s)://host`(默认 80/443)试 8848。返回 (候选 base, 表单建议写法)。
+fn alternate_base(raw: &str, ctx: &str) -> Option<(String, String)> {
+    let p = parse_addr(raw)?;
+    if p.port.is_some() {
+        return None;
+    }
+    let alt = if default_port(&p) == "8848" { "80" } else { "8848" };
+    let scheme = if p.scheme_explicit { format!("{}://", p.scheme) } else { String::new() };
+    let suggest = format!("{scheme}{}:{alt}{}", host_disp(p.host), p.path);
+    Some((assemble(&p, alt, ctx), suggest))
 }
 
 /// reqwest 的 Display 只给最外层("error sending request for url …"),真正的原因
@@ -129,7 +196,10 @@ async fn access_token(base: &str, user: &str, pass: &str) -> Result<Option<Strin
         return Ok(None); // 未启用鉴权插件
     }
     if !status.is_success() {
-        return Err(format!("Nacos 鉴权失败(HTTP {})", status.as_u16()));
+        // 把 Nacos 的原话带出来:比如「User xxx not found」一眼就能看出用户名拼错。
+        let code = status.as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Nacos 鉴权失败(HTTP {code} {})", truncate_msg(body.trim())));
     }
     let v: Value = resp.json().await.map_err(|e| format!("鉴权响应无法解析:{e}"))?;
     match v.get("accessToken").and_then(|t| t.as_str()) {
@@ -148,6 +218,18 @@ fn common_params<'a>(token: &'a Option<String>, tenant: &'a str) -> Vec<(&'stati
         p.push(("tenant", tenant.to_string()));
     }
     p
+}
+
+/// 401/403 几乎总是鉴权问题;把「为什么」直接写进错误,免得用户对着状态码猜。
+fn auth_hint(code: u16, token: &Option<String>) -> &'static str {
+    if code != 401 && code != 403 {
+        return "";
+    }
+    if token.is_none() {
+        "(Nacos 已开启鉴权,但该集群未配置账号 —— 请编辑集群,填写用户名/密码)"
+    } else {
+        "(token 被拒:检查该账号对此命名空间的权限,或密码是否已变更)"
+    }
 }
 
 // ---- 集群视图:节点 + 探活 ----
@@ -331,7 +413,7 @@ async fn get_config(
     match resp.status().as_u16() {
         200 => Ok(Some(resp.text().await.unwrap_or_default())),
         404 => Ok(None),
-        code => Err(format!("读取配置返回 HTTP {code}")),
+        code => Err(format!("读取配置返回 HTTP {code}{}", auth_hint(code, token))),
     }
 }
 
@@ -367,7 +449,7 @@ async fn publish_config(
     if code == 200 && body.trim().eq_ignore_ascii_case("true") {
         Ok(())
     } else {
-        Err(format!("发布配置被拒绝(HTTP {code} {})", body.trim()))
+        Err(format!("发布配置被拒绝(HTTP {code} {}){}", body.trim(), auth_hint(code, token)))
     }
 }
 
@@ -394,7 +476,11 @@ async fn delete_config(
     if code == 200 && body.trim().eq_ignore_ascii_case("true") {
         Ok(())
     } else {
-        Err(format!("删除配置被拒绝(HTTP {code} {})", truncate_msg(body.trim())))
+        Err(format!(
+            "删除配置被拒绝(HTTP {code} {}){}",
+            truncate_msg(body.trim()),
+            auth_hint(code, token)
+        ))
     }
 }
 
@@ -423,8 +509,9 @@ pub async fn pull_configs(conn: &NacosConn) -> Result<Vec<NacosConfigItem>, Stri
             .send()
             .await
             .map_err(|e| format!("拉取配置失败:{}", why(&e)))?;
+        let code = resp.status().as_u16();
         if !resp.status().is_success() {
-            return Err(format!("拉取配置返回 HTTP {}", resp.status().as_u16()));
+            return Err(format!("拉取配置返回 HTTP {code}{}", auth_hint(code, &token)));
         }
         let v: Value = resp.json().await.map_err(|e| format!("配置列表无法解析:{e}"))?;
         let items = v.get("pageItems").and_then(|p| p.as_array()).cloned().unwrap_or_default();
@@ -483,8 +570,9 @@ async fn list_configs(
         .send()
         .await
         .map_err(|e| format!("查询配置列表失败:{}", why(&e)))?;
+    let code = resp.status().as_u16();
     if !resp.status().is_success() {
-        return Err(format!("查询配置列表返回 HTTP {}", resp.status().as_u16()));
+        return Err(format!("查询配置列表返回 HTTP {code}{}", auth_hint(code, &token)));
     }
     let v: Value = resp.json().await.map_err(|e| format!("配置列表无法解析:{e}"))?;
     let total = v.get("totalCount").and_then(|t| t.as_i64()).unwrap_or(0);
@@ -1457,11 +1545,25 @@ pub async fn probe_cluster(
     };
     let started = Instant::now();
     let ins = inspect(&conn).await;
+    let ok = ins.nodes.iter().any(|n| n.ok);
+    // 全部不可达且有地址没写端口 → 按另一种端口惯例(8848↔80/443)补一轮探活,
+    // 命中就把正确写法直接放进提示,免得用户对着 Connection refused 猜端口。
+    let mut message = ins.message;
+    if !ok {
+        let ctx = norm_ctx(&req.context_path);
+        for raw in req.server_addr.split(',') {
+            if let Some((alt_base, suggest)) = alternate_base(raw, &ctx) {
+                if probe_base(&alt_base).await.ok {
+                    message.push_str(&format!(";检测到 {alt_base} 可提供服务,请把该地址写成 {suggest}"));
+                }
+            }
+        }
+    }
     Ok(Json(json!({
-        "ok": ins.nodes.iter().any(|n| n.ok),
+        "ok": ok,
         "source": ins.source,
         "latency_ms": started.elapsed().as_millis() as i64,
-        "message": ins.message,
+        "message": message,
         "nodes": ins.nodes,
     })))
 }
@@ -1712,9 +1814,59 @@ pub async fn init_cluster(
         conn.namespace = tpl_ns;
     }
 
+    // 命名空间必须真实存在:Nacos 配置接口对任意 tenant 都照单全收,写进未注册的
+    // tenant 就成了控制台里看不见的「孤儿配置」。检查是尽力而为:命名空间接口
+    // 查不了(老版本没有 console API / 账号权限不足)就跳过并告警,不挡初始化;
+    // 确认不存在时:真跑 → 自动注册(id = name = 输入值),试运行 → 只预告。
+    let mut ns_note: Option<NacosItemResult> = None;
+    if !conn.namespace.is_empty() {
+        let checked = match admin_ctx(&conn).await {
+            Ok(ctx) => match list_namespaces(&ctx).await {
+                Ok(list) => Some((ctx, list)),
+                Err(e) => {
+                    tracing::warn!(ns = %conn.namespace, err = %e, "查询命名空间失败,跳过存在性检查");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(ns = %conn.namespace, err = %e, "控制台接口不可用,跳过命名空间检查");
+                None
+            }
+        };
+        if let Some((ctx, list)) = checked {
+            let exists = list
+                .iter()
+                .any(|n| n.get("namespace_id").and_then(|v| v.as_str()) == Some(conn.namespace.as_str()));
+            if !exists {
+                let ns = conn.namespace.clone();
+                if req.dry_run {
+                    ns_note = Some(NacosItemResult {
+                        data_id: format!("命名空间 {ns}"),
+                        group: String::new(),
+                        status: "would_create".into(),
+                        message: "未在 Nacos 注册,执行时将自动创建".into(),
+                    });
+                } else {
+                    create_namespace(&ctx, &ns, &ns, "opsctl 初始化时自动创建")
+                        .await
+                        .map_err(|e| AppError::BadRequest(format!("命名空间 {ns} 不存在,自动创建失败:{e}")))?;
+                    ns_note = Some(NacosItemResult {
+                        data_id: format!("命名空间 {ns}"),
+                        group: String::new(),
+                        status: "created".into(),
+                        message: "未在 Nacos 注册,已自动创建".into(),
+                    });
+                }
+            }
+        }
+    }
+
     let empty_vars = BTreeMap::new();
     let vars = if literal { &empty_vars } else { &req.vars };
-    let results = init_configs(&conn, &items, vars, literal, req.overwrite, req.dry_run).await;
+    let mut results = init_configs(&conn, &items, vars, literal, req.overwrite, req.dry_run).await;
+    if let Some(n) = ns_note {
+        results.insert(0, n);
+    }
     let total = results.len() as i64;
     let ok_count = results.iter().filter(|r| r.status != "fail").count() as i64;
     let status = if ok_count == total {
@@ -2838,9 +2990,55 @@ mod tests {
             base_urls("10.0.0.1, http://n2:8849/nacos ,", "/nacos"),
             vec!["http://10.0.0.1:8848/nacos", "http://n2:8849/nacos"]
         );
+        // 写明 scheme 按 URL 语义补标准端口(反代常见);裸 host 仍按 Nacos 惯例补 8848
+        assert_eq!(
+            base_urls("http://nacos.n11, https://nacos.n11, nacos.n11", "/nacos"),
+            vec![
+                "http://nacos.n11:80/nacos",
+                "https://nacos.n11:443/nacos",
+                "http://nacos.n11:8848/nacos"
+            ]
+        );
         // empty context path (standalone deployments serving at the root)
         assert_eq!(base_urls("n1:8848", "/"), vec!["http://n1:8848"]);
         assert!(base_urls("  ,  ", "/nacos").is_empty());
+    }
+
+    #[test]
+    fn alternate_base_flips_the_port_convention() {
+        // 裸 host(默认 8848)→ 试 80;建议写法可直接粘回表单
+        assert_eq!(
+            alternate_base("nacos.n11", "/nacos"),
+            Some(("http://nacos.n11:80/nacos".into(), "nacos.n11:80".into()))
+        );
+        // 写明 scheme(默认 80)→ 试 8848
+        assert_eq!(
+            alternate_base("http://n1", "/nacos"),
+            Some(("http://n1:8848/nacos".into(), "http://n1:8848".into()))
+        );
+        // 显式端口没有第二种猜法
+        assert_eq!(alternate_base("n1:8848", "/nacos"), None);
+    }
+
+    #[test]
+    fn ipv6_literals_bracketed_and_bare() {
+        // 标准括号写法:带端口 / 不带端口(默认 8848)
+        assert_eq!(
+            base_urls("[2001:db8::1]:8080, [::1]", "/nacos"),
+            vec!["http://[2001:db8::1]:8080/nacos", "http://[::1]:8848/nacos"]
+        );
+        // 裸 IPv6 字面量(无括号、多冒号)整体视作 host
+        assert_eq!(base_urls("2001:db8::1", "/nacos"), vec!["http://[2001:db8::1]:8848/nacos"]);
+        // 带 scheme 的 URL 写法按 URL 语义走 80
+        assert_eq!(base_urls("http://[::1]/custom", "/nacos"), vec!["http://[::1]:80/custom"]);
+        // 括号不闭合 / `]` 后带非法尾巴 → 拒绝
+        assert!(base_urls("[::1", "/nacos").is_empty());
+        assert!(base_urls("[::1]junk", "/nacos").is_empty());
+        // 端口回退建议同样保持括号写法
+        assert_eq!(
+            alternate_base("[::1]", "/nacos"),
+            Some(("http://[::1]:80/nacos".into(), "[::1]:80".into()))
+        );
     }
 
     #[test]
