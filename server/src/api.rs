@@ -1851,8 +1851,11 @@ fn resolve_in_work_dir(
 ) -> Result<std::path::PathBuf, AppError> {
     use std::path::Component;
     let rel_path = std::path::Path::new(rel);
+    // `\` 与 `:` 在 Unix 上是合法文件名字符,但这里的路径要跨平台安全:
+    // Windows 下它们是分隔符/盘符,统一拒绝,两个平台行为才一致。
     if rel_path.as_os_str().is_empty()
         || rel_path.is_absolute()
+        || rel.contains(['\\', ':'])
         || rel_path.components().any(|c| !matches!(c, Component::Normal(_)))
     {
         return Err(AppError::BadRequest("非法路径".into()));
