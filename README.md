@@ -19,6 +19,7 @@ Rust workspace:`core`(共享模型/DTO)、`server`(opsctl-vault,axum + SQLite,�
   (1.x·2.x 走 `/v1/auth/*` + `/v1/console/namespaces`,3.x 自动切 `/v3/auth/*` + `/v3/console/core/namespace`);
   集群口令进金库加密,每次写操作落审计。
 - **其它屏**:执行模板(变量代入)、消息中心(站内通知)、审计(筛选+详情+CSV/JSON 导出)、设置(个人/会话撤销/金库/Telegram·Git 配置)。
+- **WebSocket 实时通道**:`/api/ws`(鉴权走 query:JWT+设备绑定,与 REST 同一套校验);在线表区分 web/桌面客户端与登录设备,管理员看全量、普通用户只见自己;管理员可发集群广播/定向消息(`/api/ws/broadcast`,同时落站内信);多实例下以 SQLite 为总线(在线表 + 消息游标轮询),连接漂移到任意节点都能收到;会话撤销即踢线。
 
 > 演示态(未接外部系统,UI 标注):Telegram bot、真实 git push、mysql/postgres。
 
@@ -47,4 +48,4 @@ cargo test -p opsctl-server      # 88 个 API 集成测试(临时 sqlite,隔离�
 - `jsonwebtoken` 10 → 启用 `rust_crypto` provider。
 - `russh` → `default-features=false, features=["ring","flate2","rsa"]`(避开 aws-lc-rs/NASM)。
 - sqlx 仅编译 `sqlite`(mysql/pg 待接);SQLite 单写入,横向扩容需换 Postgres。
-- `reqwest` 关掉默认特性(仅 `json`):Nacos 走 http,不引入 aws-lc-rs/NASM 依赖;暂不支持 https 与 IPv6 字面量地址。
+- `reqwest` 关掉默认特性(仅 `json`):Nacos 走 http,不引入 aws-lc-rs/NASM 依赖;暂不支持 https。IPv6 字面量地址支持 `[2001:db8::1]:8848` 与裸写(不带端口,默认 8848)。
