@@ -69,7 +69,9 @@ async fn spawn_inner(unseal: bool) -> TestApp {
             retention_days: 30,
             dir: backup_dir.clone(),
         }),
+        ws: Arc::new(opsctl_server::ws::WsHub::new()),
     };
+    tokio::spawn(opsctl_server::ws::run_dispatcher(state.clone()));
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

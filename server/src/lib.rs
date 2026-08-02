@@ -16,6 +16,7 @@ pub mod state;
 pub mod store;
 pub mod totp;
 pub mod vault;
+pub mod ws;
 
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -96,6 +97,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/templates/{id}/file", get(api::template_file_view))
         .route("/backup/status", get(api::backup_status))
         .route("/backup/run", post(api::backup_run))
+        // ---- WebSocket:实时通道 + 在线管理 + 集群广播 ----
+        .route("/ws", get(ws::ws_upgrade))
+        .route("/ws/online", get(ws::online))
+        .route("/ws/broadcast", post(ws::broadcast))
         // ---- Nacos 管理(集群总览 + 配置初始化,均 admin-only)----
         .route("/nacos/clusters", get(nacos::list_clusters).post(nacos::create_cluster))
         .route(

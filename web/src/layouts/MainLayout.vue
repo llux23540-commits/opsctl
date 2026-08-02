@@ -1,13 +1,15 @@
 <script setup>
-import { computed, h, ref, onMounted, watch } from 'vue';
+import { computed, h, ref, onMounted, onUnmounted, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { NBadge } from 'naive-ui';
+import { NBadge, useNotification } from 'naive-ui';
 import { useAuth } from '../store/auth';
 import { api } from '../api';
+import { wsConnect, wsClose, wsOn } from '../ws';
 
 const router = useRouter();
 const route = useRoute();
 const auth = useAuth();
+const notification = useNotification();
 
 const pendingCount = ref(0);
 const unread = ref(0);
@@ -41,11 +43,35 @@ async function openNotif(m) {
   router.push(m.link || '/messages');
 }
 const fmtTime = (t) => new Date(t * 1000).toLocaleString('zh-CN');
+// ---- WebSocket 实时通道:集群广播弹通知,会话被撤销即登出 ----
+const wsOff = [];
 onMounted(() => {
   refreshPending();
   refreshUnread();
   window.addEventListener('approvals-changed', refreshPending);
   window.addEventListener('messages-changed', refreshUnread);
+  wsConnect();
+  wsOff.push(
+    wsOn('broadcast', (m) => {
+      notification.info({
+        title: m.title || '集群消息',
+        content: m.body || '',
+        meta: `${m.from || ''} · ${fmtTime(m.ts)}`,
+        duration: 8000,
+      });
+      refreshUnread();
+      loadRecent();
+    }),
+    wsOn('bye', () => {
+      notification.warning({ title: '会话已撤销', content: '当前登录已被管理员撤销,请重新登录', duration: 5000 });
+      logout();
+    }),
+  );
+});
+onUnmounted(() => {
+  window.removeEventListener('approvals-changed', refreshPending);
+  window.removeEventListener('messages-changed', refreshUnread);
+  wsOff.forEach((off) => off());
 });
 // re-check whenever navigation lands (approve/reject/read changes counts)
 watch(() => route.path, () => { refreshPending(); refreshUnread(); });
@@ -67,6 +93,7 @@ const menuOptions = computed(() => {
   ];
   if (auth.isAdmin) items.splice(1, 0,
     { label: '用户与权限', key: '/users' },
+    { label: '在线与广播', key: '/online' },
     { label: '资产管理', key: '/assets' },
     { label: 'Nacos 管理', key: '/nacos' },
     { label: '授权规则', key: '/access' },
@@ -100,6 +127,7 @@ function onUserSelect(key) {
 }
 
 function logout() {
+  wsClose();
   auth.logout();
   router.push('/login');
 }

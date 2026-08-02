@@ -10,6 +10,7 @@ const routes = [
       { path: 'console', component: () => import('../views/Console.vue'), meta: { title: '节点执行' } },
       { path: 'assets', component: () => import('../views/Assets.vue'), meta: { title: '资产管理', admin: true } },
       { path: 'users', component: () => import('../views/Users.vue'), meta: { title: '用户与权限', admin: true } },
+      { path: 'online', component: () => import('../views/Online.vue'), meta: { title: '在线与广播', admin: true } },
       { path: 'access', component: () => import('../views/Access.vue'), meta: { title: '授权规则', admin: true } },
       { path: 'nacos', component: () => import('../views/Nacos.vue'), meta: { title: 'Nacos 管理', admin: true } },
       { path: 'nacos/:id', component: () => import('../views/NacosCluster.vue'), meta: { title: 'Nacos 集群管理', admin: true } },

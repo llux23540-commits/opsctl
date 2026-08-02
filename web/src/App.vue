@@ -19,11 +19,13 @@ const themeOverrides = {
 <template>
   <n-config-provider :theme="darkTheme" :theme-overrides="themeOverrides" :locale="zhCN" :date-locale="dateZhCN">
     <n-loading-bar-provider>
-      <n-message-provider>
-        <n-dialog-provider>
-          <router-view />
-        </n-dialog-provider>
-      </n-message-provider>
+      <n-notification-provider placement="bottom-right">
+        <n-message-provider>
+          <n-dialog-provider>
+            <router-view />
+          </n-dialog-provider>
+        </n-message-provider>
+      </n-notification-provider>
     </n-loading-bar-provider>
   </n-config-provider>
 </template>

@@ -13,6 +13,8 @@ pub struct AppState {
     pub default_ttl_secs: i64,
     pub vault: Arc<Vault>,
     pub backup: Arc<BackupCfg>,
+    /// 本节点 WebSocket 连接注册表(跨节点在线态在 ws_presence 表)。
+    pub ws: Arc<crate::ws::WsHub>,
 }
 
 /// Current unix time in seconds.

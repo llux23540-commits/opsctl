@@ -17,8 +17,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 argon2 = "0.5.3"
 figment = { version = "0.10.19", features = ["toml", "env"] }

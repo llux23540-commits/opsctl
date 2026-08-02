@@ -107,6 +107,9 @@ export const api = {
   updateFlags: (body) => http.put('/flags', body).then((r) => r.data),
   loginOtp: (pending_id, code) => http.post('/login/otp', { pending_id, code }).then((r) => r.data),
   register: (body) => http.post('/register', body).then((r) => r.data),
+  // ---- WebSocket 管理:在线连接 + 集群消息 ----
+  wsOnline: () => http.get('/ws/online').then((r) => r.data),
+  wsBroadcast: (body) => http.post('/ws/broadcast', body).then((r) => r.data),
   // ---- Nacos 管理 ----
   nacosClusters: () => http.get('/nacos/clusters').then((r) => r.data),
   createNacosCluster: (body) => http.post('/nacos/clusters', body).then((r) => r.data),

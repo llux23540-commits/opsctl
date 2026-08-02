@@ -8,7 +8,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       // dev: forward /api to the Rust server
-      '/api': { target: 'http://127.0.0.1:8443', changeOrigin: true },
+      '/api': { target: 'http://127.0.0.1:8443', changeOrigin: true, ws: true },
     },
   },
   build: { outDir: 'dist' },

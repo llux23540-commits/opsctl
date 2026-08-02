@@ -4,8 +4,10 @@
 //! needs no `DATABASE_URL`. PostgreSQL support is a later swap behind the same
 //! interface.
 
+use std::str::FromStr;
+
 use anyhow::Result;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 
 #[derive(Clone)]
@@ -38,6 +40,33 @@ pub struct SessionRow {
     pub last_seen: i64,
     pub ip: String,
     pub revoked: i64,
+}
+
+/// 一条 WebSocket 在线连接(跨节点可见;见 ws.rs 的漂移设计)。
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct WsPresenceRow {
+    pub conn_id: String,
+    pub node_id: String,
+    pub user_id: String,
+    pub email: String,
+    pub role: String,
+    pub device_id: String,
+    pub client: String,
+    pub ip: String,
+    pub connected_at: i64,
+    pub last_seen: i64,
+}
+
+/// 一条待投递的集群消息(seq 是各节点的投递游标)。
+#[derive(Debug, Clone, FromRow)]
+pub struct WsMessageRow {
+    pub seq: i64,
+    pub target_user_id: String,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub sender_email: String,
+    pub ts: i64,
 }
 
 #[derive(Debug, Clone, FromRow, serde::Serialize)]
@@ -319,9 +348,15 @@ pub struct NacosAccountTemplateRow {
 
 impl Store {
     pub async fn connect(url: &str) -> Result<Self> {
+        // WAL:写不再阻塞读(默认 rollback journal 下一个写事务会挡住全部读),
+        // 这是 SQLite 上多任务(API + 备份 + WS 心跳)并存的稳定性底线;
+        // busy_timeout 让偶发的写锁竞争排队等待而不是直接报 SQLITE_BUSY。
+        let opts = SqliteConnectOptions::from_str(url)?
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(url)
+            .connect_with(opts)
             .await?;
         Ok(Self { pool })
     }
@@ -528,6 +563,27 @@ impl Store {
             ok_count INTEGER NOT NULL DEFAULT 0,
             dry_run INTEGER NOT NULL DEFAULT 0,
             items TEXT NOT NULL DEFAULT '[]',              -- json: 每条配置的结果
+            ts INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ws_presence (
+            conn_id TEXT PRIMARY KEY,                      -- "<node_id>:<n>"
+            node_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT 'viewer',
+            device_id TEXT NOT NULL DEFAULT '',
+            client TEXT NOT NULL DEFAULT 'web',            -- web | desktop | other
+            ip TEXT NOT NULL DEFAULT '',
+            connected_at INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL                     -- 心跳,超窗即视为下线
+        );
+        CREATE TABLE IF NOT EXISTS ws_messages (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,         -- 各节点的投递游标
+            target_user_id TEXT NOT NULL DEFAULT '',       -- '' = 全员广播
+            kind TEXT NOT NULL DEFAULT 'broadcast',
+            title TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            sender_email TEXT NOT NULL DEFAULT '',
             ts INTEGER NOT NULL
         );
         "#;
@@ -1108,6 +1164,95 @@ impl Store {
         sqlx::query("DELETE FROM notifications WHERE id = ? AND user_id = ?")
             .bind(id).bind(user_id).execute(&self.pool).await?;
         Ok(())
+    }
+
+    // ---- websocket 在线表 & 集群消息(多实例漂移以 DB 为总线,见 ws.rs)----
+
+    pub async fn upsert_ws_presence(&self, r: &WsPresenceRow) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO ws_presence (conn_id,node_id,user_id,email,role,device_id,client,ip,connected_at,last_seen) \
+             VALUES (?,?,?,?,?,?,?,?,?,?) \
+             ON CONFLICT(conn_id) DO UPDATE SET last_seen = excluded.last_seen")
+            .bind(&r.conn_id).bind(&r.node_id).bind(&r.user_id).bind(&r.email).bind(&r.role)
+            .bind(&r.device_id).bind(&r.client).bind(&r.ip).bind(r.connected_at).bind(r.last_seen)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+    /// 本节点全部连接一条 UPDATE 心跳 —— 每节拍 1 次写,与连接数无关。
+    pub async fn touch_ws_presence_node(&self, node_id: &str, ts: i64) -> Result<()> {
+        sqlx::query("UPDATE ws_presence SET last_seen = ? WHERE node_id = ?")
+            .bind(ts).bind(node_id).execute(&self.pool).await?;
+        Ok(())
+    }
+    /// 给定 sid 集合里已被撤销(或已不存在)仍需踢线的:分块 IN 查询,
+    /// 每节拍 ceil(N/400) 次读,而不是每连接一次。
+    pub async fn revoked_among(&self, sids: &[String]) -> Result<Vec<String>> {
+        let mut alive = std::collections::HashSet::new();
+        for chunk in sids.chunks(400) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            // 动态部分只有占位符个数,值全部走 bind —— 无注入面。
+            let sql = format!("SELECT sid FROM sessions WHERE revoked = 0 AND sid IN ({marks})");
+            let mut q = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(sql));
+            for sid in chunk {
+                q = q.bind(sid);
+            }
+            for (sid,) in q.fetch_all(&self.pool).await? {
+                alive.insert(sid);
+            }
+        }
+        Ok(sids.iter().filter(|s| !alive.contains(*s)).cloned().collect())
+    }
+    /// 全员站内信:单条 INSERT…SELECT,万人也只是一次写,不逐条 await。
+    /// (跳过每用户的裁剪 —— 广播低频,裁剪由下一次单条 push 时顺带完成。)
+    pub async fn push_notification_all(
+        &self, kind: &str, title: &str, body: &str, link: &str, ts: i64,
+    ) -> Result<i64> {
+        let done = sqlx::query(
+            "INSERT INTO notifications (id,user_id,kind,title,body,link,ts,read) \
+             SELECT lower(hex(randomblob(16))), id, ?,?,?,?,?, 0 FROM users")
+            .bind(kind).bind(title).bind(body).bind(link).bind(ts)
+            .execute(&self.pool).await?;
+        Ok(done.rows_affected() as i64)
+    }
+    pub async fn delete_ws_presence(&self, conn_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM ws_presence WHERE conn_id = ?")
+            .bind(conn_id).execute(&self.pool).await?;
+        Ok(())
+    }
+    /// 节点崩溃不会删自己的行:超过 cutoff 没心跳的一律清掉。
+    pub async fn purge_stale_ws_presence(&self, cutoff: i64) -> Result<()> {
+        sqlx::query("DELETE FROM ws_presence WHERE last_seen < ?")
+            .bind(cutoff).execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn list_ws_presence(&self, fresh_after: i64) -> Result<Vec<WsPresenceRow>> {
+        Ok(sqlx::query_as::<_, WsPresenceRow>(
+            "SELECT * FROM ws_presence WHERE last_seen >= ? ORDER BY connected_at DESC")
+            .bind(fresh_after).fetch_all(&self.pool).await?)
+    }
+    pub async fn list_ws_presence_for(&self, user_id: &str, fresh_after: i64) -> Result<Vec<WsPresenceRow>> {
+        Ok(sqlx::query_as::<_, WsPresenceRow>(
+            "SELECT * FROM ws_presence WHERE user_id = ? AND last_seen >= ? ORDER BY connected_at DESC")
+            .bind(user_id).bind(fresh_after).fetch_all(&self.pool).await?)
+    }
+    pub async fn insert_ws_message(
+        &self, target_user_id: &str, kind: &str, title: &str, body: &str, sender_email: &str, ts: i64,
+    ) -> Result<i64> {
+        let done = sqlx::query(
+            "INSERT INTO ws_messages (target_user_id,kind,title,body,sender_email,ts) VALUES (?,?,?,?,?,?)")
+            .bind(target_user_id).bind(kind).bind(title).bind(body).bind(sender_email).bind(ts)
+            .execute(&self.pool).await?;
+        Ok(done.last_insert_rowid())
+    }
+    pub async fn ws_messages_after(&self, seq: i64, limit: i64) -> Result<Vec<WsMessageRow>> {
+        Ok(sqlx::query_as::<_, WsMessageRow>(
+            "SELECT * FROM ws_messages WHERE seq > ? ORDER BY seq ASC LIMIT ?")
+            .bind(seq).bind(limit).fetch_all(&self.pool).await?)
+    }
+    pub async fn ws_message_max_seq(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COALESCE(MAX(seq), 0) FROM ws_messages")
+            .fetch_one(&self.pool).await?;
+        Ok(n)
     }
     pub async fn delete_rule(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM authorization_rules WHERE id = ?").bind(id).execute(&self.pool).await?;

@@ -55,7 +55,11 @@ async fn main() -> anyhow::Result<()> {
         default_ttl_secs: cfg.auth.default_ttl_secs,
         vault,
         backup: Arc::new(cfg.backup.clone()),
+        ws: Arc::new(opsctl_server::ws::WsHub::new()),
     };
+
+    // WebSocket 分发器:投递集群消息、心跳在线行、踢撤销会话(见 ws.rs)
+    tokio::spawn(opsctl_server::ws::run_dispatcher(state.clone()));
 
     if cfg.backup.enabled {
         tokio::spawn(opsctl_server::backup::scheduler(state.clone()));
